@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "livekit-evals"
+version = "0.1.0"
+description = "Track and evaluate LiveKit agent sessions with automatic metrics, transcripts, and usage analytics"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Speechify", email = "support@speechify.com"}
+]
+keywords = ["livekit", "agents", "analytics", "metrics", "evaluation", "voice-ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Communications :: Telephony",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+dependencies = [
+    "livekit-agents>=0.8.0",
+    "aiohttp>=3.9.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/speechify/livekit-evals"
+Documentation = "https://github.com/speechify/livekit-evals#readme"
+Repository = "https://github.com/speechify/livekit-evals"
+Issues = "https://github.com/speechify/livekit-evals/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["livekit_evals*"]
+exclude = ["tests*", "examples*"]
+
