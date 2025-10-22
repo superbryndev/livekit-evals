@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Expanded provider detection to support 25+ providers including:
+  - **LLM**: OpenAI, Anthropic, Google, Meta (Llama), Mistral, Cohere, Perplexity, Groq, Together, Replicate, Hugging Face
+  - **TTS**: ElevenLabs, Cartesia, PlayHT, Resemble, Murf, WellSaid, Speechify, Sarvam, Azure, AWS Polly, Google Cloud
+  - **STT**: Deepgram, AssemblyAI, Rev, Speechmatics, Gladia
+  - **Realtime**: LiveKit, Twilio, Vonage
+- Support for custom telephony rates via `call_rate_usd` parameter:
+  - Pass custom telephony rate per minute ($/min) to `create_webhook_handler()`
+  - Automatically included in cost calculations
+  - Overrides default provider costs when provided
+  - Useful for custom telephony providers (Twilio, Vonage, etc.)
+
+### Fixed
+- Added missing `tts_voice_id` field to `usage_metrics` dictionary initialization to prevent KeyError when extracting TTS voice configuration
+- Improved `tts_voice_id` extraction with fallback to use `tts_model` when no explicit voice_id attribute exists (common for providers like Sarvam where model name IS the voice)
+
 ### Planned
 - CLI tool for testing webhook connectivity
-- Additional provider detection (Azure, AWS, etc.)
 - Custom webhook URL configuration
 - Retry logic for failed webhook deliveries
 
@@ -50,6 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secure environment variable handling
 - No sensitive data logged in production
 
-[Unreleased]: https://github.com/speechify/livekit-evals/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/speechify/livekit-evals/releases/tag/v0.1.0
+[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/superbryndev/livekit-evals/releases/tag/v0.1.0
 

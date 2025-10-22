@@ -102,5 +102,5 @@ After running these examples, you'll see webhook payloads containing:
 - 📞 Call duration and metadata
 - 🔍 System prompts and configuration
 
-Check your logs for `SPEECHIFY_WEBHOOK_SENT` to confirm successful delivery!
+Check your logs for `SUPERBRYN_WEBHOOK_SENT` to confirm successful delivery!
 

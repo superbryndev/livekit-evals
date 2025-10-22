@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Speechify", email = "support@speechify.com"}
+    {name = "superbryndev", email = "support@superbryndev.com"}
 ]
 keywords = ["livekit", "agents", "analytics", "metrics", "evaluation", "voice-ai"]
 classifiers = [
@@ -33,10 +33,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/speechify/livekit-evals"
-Documentation = "https://github.com/speechify/livekit-evals#readme"
-Repository = "https://github.com/speechify/livekit-evals"
-Issues = "https://github.com/speechify/livekit-evals/issues"
+Homepage = "https://github.com/superbryndev/livekit-evals"
+Documentation = "https://github.com/superbryndev/livekit-evals#readme"
+Repository = "https://github.com/superbryndev/livekit-evals"
+Issues = "https://github.com/superbryndev/livekit-evals/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

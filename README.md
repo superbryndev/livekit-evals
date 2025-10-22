@@ -336,6 +336,20 @@ webhook_handler = create_webhook_handler(
 )
 ```
 
+### Custom Telephony Rates
+
+If you're using custom telephony providers (Twilio, Vonage, etc.) with specific per-minute rates:
+
+```python
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    call_rate_usd=0.015  # Your custom rate per minute ($/min)
+)
+```
+
+This overrides default provider costs and ensures accurate cost tracking for your telephony usage.
+
 ### Passing Metadata via Job Context
 
 You can pass custom metadata when creating LiveKit jobs:
@@ -367,19 +381,19 @@ logging.basicConfig(level=logging.DEBUG)
 ```
 
 **Look for these log messages:**
-- `SPEECHIFY_WEBHOOK_HANDLER_CREATED` - Handler initialized
-- `SPEECHIFY_WEBHOOK_SENT` - Webhook delivered successfully
-- `SPEECHIFY_WEBHOOK_UNAUTHORIZED` - Invalid API key
-- `SPEECHIFY_WEBHOOK_FAILED` - Delivery failed
-- `SPEECHIFY_WEBHOOK_ERROR` - Exception occurred
+- `SUPERBRYN_WEBHOOK_HANDLER_CREATED` - Handler initialized
+- `SUPERBRYN_WEBHOOK_SENT` - Webhook delivered successfully
+- `SUPERBRYN_WEBHOOK_UNAUTHORIZED` - Invalid API key
+- `SUPERBRYN_WEBHOOK_FAILED` - Delivery failed
+- `SUPERBRYN_WEBHOOK_ERROR` - Exception occurred
 
 ### Common Errors
 
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `SUPERBRYN_API_KEY not configured` | Missing API key | Set `SUPERBRYN_API_KEY` environment variable |
-| `SPEECHIFY_WEBHOOK_UNAUTHORIZED` | Invalid API key | Verify your API key is correct |
-| `SPEECHIFY_WEBHOOK_FORBIDDEN` | Expired/disabled key | Generate a new API key |
+| `SUPERBRYN_WEBHOOK_UNAUTHORIZED` | Invalid API key | Verify your API key is correct |
+| `SUPERBRYN_WEBHOOK_FORBIDDEN` | Expired/disabled key | Generate a new API key |
 | `No empty turn found to fill` | State change timing issue | Usually harmless, check logs for patterns |
 
 ### Missing Transcript Data
@@ -391,14 +405,45 @@ Ensure `webhook_handler.attach_to_session(session)` is called:
 
 ### Provider Detection Issues
 
-The package auto-detects providers from model names. Supported providers:
-- OpenAI (gpt, whisper, tts-1)
+The package auto-detects providers from model names. Supported providers (25+):
+
+**LLM Providers:**
+- OpenAI (gpt, whisper, tts-1, o1, o3)
 - Anthropic (claude)
-- Google (gemini, palm)
-- Sarvam (saarika)
-- ElevenLabs (eleven)
+- Google (gemini, palm, bard, gemma)
+- Meta (llama, meta-llama)
+- Mistral (mistral, mixtral)
+- Cohere (cohere, command)
+- Perplexity (perplexity, pplx)
+- Groq
+- Together AI (together, togethercomputer)
+- Replicate
+- Hugging Face (huggingface, hf-)
+
+**TTS Providers:**
+- ElevenLabs (eleven, elevenlabs)
 - Cartesia (cartesia, sonic)
-- Deepgram (deepgram, nova)
+- PlayHT (playht, play.ht)
+- Resemble AI (resemble, resembleai)
+- Murf (murf, murf.ai)
+- WellSaid Labs (wellsaid, wellsaidlabs)
+- Speechify
+- Sarvam (saarika, sarvam, bulbul)
+- Azure/Microsoft (azure, microsoft)
+- AWS Polly (aws, polly, amazon)
+- Google Cloud (gcloud, google-cloud)
+
+**STT Providers:**
+- Deepgram (deepgram, nova, aura)
+- AssemblyAI (assemblyai, assembly)
+- Rev.ai (rev.ai, revai)
+- Speechmatics
+- Gladia
+
+**Realtime/Multi-modal:**
+- LiveKit
+- Twilio
+- Vonage
 
 If your provider isn't detected, it will show as `"unknown"` but won't affect functionality.
 
@@ -429,17 +474,17 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🔗 Links
 
 - [LiveKit Agents Documentation](https://docs.livekit.io/agents/)
-- [GitHub Repository](https://github.com/speechify/livekit-evals)
-- [Issue Tracker](https://github.com/speechify/livekit-evals/issues)
+- [GitHub Repository](https://github.com/superbryndev/livekit-evals)
+- [Issue Tracker](https://github.com/superbryndev/livekit-evals/issues)
 - [Get API Key](https://your-platform.com/api-keys) *(placeholder)*
 
 ## 💡 Support
 
-- 📧 Email: support@speechify.com
-- 💬 GitHub Issues: [Report a bug](https://github.com/speechify/livekit-evals/issues)
-- 📚 Documentation: [README](https://github.com/speechify/livekit-evals#readme)
+- 📧 Email: support@superbryn.com
+- 💬 GitHub Issues: [Report a bug](https://github.com/superbryndev/livekit-evals/issues)
+- 📚 Documentation: [README](https://github.com/superbryndev/livekit-evals#readme)
 
 ---
 
-Made with ❤️ by [Speechify](https://speechify.com)
+Made with ❤️ by [SuperBryn](https://www.superbryn.com)
 

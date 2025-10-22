@@ -83,6 +83,7 @@ class WebhookHandler:
         room: Room,
         is_deployed_on_lk_cloud: bool,
         livekit_project_id: Optional[str] = None,
+        call_rate_usd: Optional[float] = None,
     ):
         """
         Initialize webhook handler.
@@ -93,12 +94,14 @@ class WebhookHandler:
             room: LiveKit room instance
             is_deployed_on_lk_cloud: Whether agent is deployed on LiveKit Cloud ($0.014/min)
             livekit_project_id: LiveKit project ID for agent uniqueness (optional)
+            call_rate_usd: Custom telephony rate per minute ($/min) for cost calculation (optional)
         """
         self.webhook_url = webhook_url
         self.api_key = api_key
         self.room = room
         self.is_deployed_on_lk_cloud = is_deployed_on_lk_cloud
         self.livekit_project_id = livekit_project_id
+        self.call_rate_usd = call_rate_usd
         
         # These will be auto-detected
         self.agent_id: Optional[str] = None
@@ -130,6 +133,7 @@ class WebhookHandler:
             "audio_duration_seconds": 0,
             "tts_provider": None,
             "tts_model": None,
+            "tts_voice_id": None,
             "tts_characters": 0,
             "tts_audio_duration_seconds": 0,
         }
@@ -219,6 +223,11 @@ class WebhookHandler:
                         self.usage_metrics["tts_voice_id"] = opts.voice
                     if hasattr(opts, 'model') and not self.usage_metrics["tts_model"]:
                         self.usage_metrics["tts_model"] = opts.model
+                
+                # Fallback: if no voice_id found but model exists, use model as voice_id
+                # This is common for providers like Sarvam where model name IS the voice
+                if not self.usage_metrics["tts_voice_id"] and self.usage_metrics["tts_model"]:
+                    self.usage_metrics["tts_voice_id"] = self.usage_metrics["tts_model"]
             
             # Apply provider detection based on model names
             if self.usage_metrics["llm_model"]:
@@ -243,26 +252,80 @@ class WebhookHandler:
             logger.warning("Failed to extract session config: %s", e)
     
     def _detect_provider_from_model_name(self, model_name: str) -> str:
-        """Detect provider from model name (from Whispey's implementation)."""
+        """Detect provider from model name with comprehensive provider support."""
         if not model_name:
             return 'unknown'
         
         model_lower = model_name.lower()
         
-        if any(x in model_lower for x in ['gpt', 'openai', 'whisper', 'tts-1']):
+        # LLM Providers
+        if any(x in model_lower for x in ['gpt', 'openai', 'whisper', 'tts-1', 'o1-', 'o3-']):
             return 'openai'
         elif any(x in model_lower for x in ['claude', 'anthropic']):
             return 'anthropic'
-        elif any(x in model_lower for x in ['gemini', 'palm', 'bard']):
+        elif any(x in model_lower for x in ['gemini', 'palm', 'bard', 'gemma']):
             return 'google'
-        elif any(x in model_lower for x in ['saarika', 'sarvam']):
-            return 'sarvam'
+        elif any(x in model_lower for x in ['llama', 'meta-llama']):
+            return 'meta'
+        elif any(x in model_lower for x in ['mistral', 'mixtral']):
+            return 'mistral'
+        elif any(x in model_lower for x in ['cohere', 'command']):
+            return 'cohere'
+        elif any(x in model_lower for x in ['perplexity', 'pplx']):
+            return 'perplexity'
+        elif any(x in model_lower for x in ['groq']):
+            return 'groq'
+        elif any(x in model_lower for x in ['together', 'togethercomputer']):
+            return 'together'
+        elif any(x in model_lower for x in ['replicate']):
+            return 'replicate'
+        elif any(x in model_lower for x in ['huggingface', 'hf-']):
+            return 'huggingface'
+        
+        # TTS Providers
         elif any(x in model_lower for x in ['eleven', 'elevenlabs']):
             return 'elevenlabs'
         elif any(x in model_lower for x in ['cartesia', 'sonic']):
             return 'cartesia'
-        elif any(x in model_lower for x in ['deepgram', 'nova']):
+        elif any(x in model_lower for x in ['playht', 'play.ht', 'play-ht']):
+            return 'playht'
+        elif any(x in model_lower for x in ['resemble', 'resembleai']):
+            return 'resemble'
+        elif any(x in model_lower for x in ['murf', 'murf.ai']):
+            return 'murf'
+        elif any(x in model_lower for x in ['wellsaid', 'wellsaidlabs']):
+            return 'wellsaid'
+        elif any(x in model_lower for x in ['speechify']):
+            return 'speechify'
+        elif any(x in model_lower for x in ['saarika', 'sarvam', 'bulbul']):
+            return 'sarvam'
+        elif any(x in model_lower for x in ['azure', 'microsoft']):
+            return 'azure'
+        elif any(x in model_lower for x in ['aws', 'polly', 'amazon']):
+            return 'aws'
+        elif any(x in model_lower for x in ['gcloud', 'google-cloud']):
+            return 'google-cloud'
+        
+        # STT Providers
+        elif any(x in model_lower for x in ['deepgram', 'nova', 'aura']):
             return 'deepgram'
+        elif any(x in model_lower for x in ['assemblyai', 'assembly']):
+            return 'assemblyai'
+        elif any(x in model_lower for x in ['rev.ai', 'revai']):
+            return 'rev'
+        elif any(x in model_lower for x in ['speechmatics']):
+            return 'speechmatics'
+        elif any(x in model_lower for x in ['gladia']):
+            return 'gladia'
+        
+        # Multi-modal/Realtime Providers
+        elif any(x in model_lower for x in ['livekit']):
+            return 'livekit'
+        elif any(x in model_lower for x in ['twilio']):
+            return 'twilio'
+        elif any(x in model_lower for x in ['vonage']):
+            return 'vonage'
+        
         else:
             return 'unknown'
     
@@ -384,14 +447,14 @@ class WebhookHandler:
                 if speaker == "user":
                     self.last_user_turn_time_ms = turn["end_time_ms"] if turn["end_time_ms"] else turn["start_time_ms"]
                 
-                logger.info("✓ Filled text for %s turn: %s...", speaker, text[:50])
+                logger.info("✓ Filled text for %s turn: %s...", speaker, text[:500])
                 turn_found = True
                 break
         
         if not turn_found:
-            logger.warning("No empty %s turn found to fill with text: %s...", speaker, text[:50])
+            logger.warning("No empty %s turn found to fill with text: %s...", speaker, text[:500])
         
-        logger.debug("Transcript turn text updated: %s - %s...", speaker, text[:50])
+        logger.debug("Transcript turn text updated: %s - %s...", speaker, text[:500])
     
     def _on_user_input_transcribed(self, event: UserInputTranscribedEvent) -> None:
         """Handle user input transcribed event for additional metadata."""
@@ -414,8 +477,8 @@ class WebhookHandler:
             state_time_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else 0
             timestamp = datetime.now(timezone.utc).isoformat()
 
-            logger.info("Agent state changed: %s -> %s at %dms (turns count: %d)",
-                       old_state, new_state, state_time_ms, len(self.transcript_turns))
+            # logger.info("Agent state changed: %s -> %s at %dms (turns count: %d)",
+            #            old_state, new_state, state_time_ms, len(self.transcript_turns))
             
             # START: non-speaking -> speaking
             if new_state == 'speaking' and old_state != 'speaking':
@@ -440,14 +503,14 @@ class WebhookHandler:
             
             # END: speaking -> non-speaking
             elif old_state == 'speaking' and new_state != 'speaking':
-                logger.info("Agent STOPPED speaking at %dms", state_time_ms)
+                # logger.info("Agent STOPPED speaking at %dms", state_time_ms)
                 # Find the last assistant turn without an end time
                 for turn in reversed(self.transcript_turns):
                     if turn["speaker"] == "assistant" and turn["end_time_ms"] is None:
                         turn["end_time_ms"] = state_time_ms
                         turn["end_timestamp"] = timestamp
-                        duration_ms = state_time_ms - turn["start_time_ms"]
-                        logger.info("✓ Updated assistant turn end time: duration=%dms", duration_ms)
+                        # duration_ms = state_time_ms - turn["start_time_ms"]
+                        # logger.info("✓ Updated assistant turn end time: duration=%dms", duration_ms)
                         break
             
         except Exception as e:  # noqa: BLE001
@@ -462,8 +525,8 @@ class WebhookHandler:
             state_time_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else 0
             timestamp = datetime.now(timezone.utc).isoformat()
 
-            logger.info("User state changed: %s -> %s at %dms (turns count: %d)",
-                       old_state, new_state, state_time_ms, len(self.transcript_turns))
+            # logger.info("User state changed: %s -> %s at %dms (turns count: %d)",
+            #            old_state, new_state, state_time_ms, len(self.transcript_turns))
             
             # START: non-speaking -> speaking
             if new_state == 'speaking' and old_state != 'speaking':
@@ -484,18 +547,18 @@ class WebhookHandler:
                     "speaker_id": None,
                 }
                 self.transcript_turns.append(turn)
-                logger.info("✓ Created user turn at start")
+                # logger.info("✓ Created user turn at start")
             
             # END: speaking -> non-speaking
             elif old_state == 'speaking' and new_state != 'speaking':
-                logger.info("User STOPPED speaking at %dms", state_time_ms)
+                # logger.info("User STOPPED speaking at %dms", state_time_ms)
                 # Find the last user turn without an end time
                 for turn in reversed(self.transcript_turns):
                     if turn["speaker"] == "user" and turn["end_time_ms"] is None:
                         turn["end_time_ms"] = state_time_ms
                         turn["end_timestamp"] = timestamp
-                        duration_ms = state_time_ms - turn["start_time_ms"]
-                        logger.info("✓ Updated user turn end time: duration=%dms", duration_ms)
+                        # duration_ms = state_time_ms - turn["start_time_ms"]
+                        # logger.info("✓ Updated user turn end time: duration=%dms", duration_ms)
                         break
             
         except Exception as e:  # noqa: BLE001
@@ -507,8 +570,8 @@ class WebhookHandler:
             current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             speech_time_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else 0
             
-            logger.debug("Speech created: source=%s, user_initiated=%s at %dms",
-                        event.source, event.user_initiated, speech_time_ms)
+            # logger.debug("Speech created: source=%s, user_initiated=%s at %dms",
+            #             event.source, event.user_initiated, speech_time_ms)
             
             # Track speech creation for analytics
             if not hasattr(self, 'speech_events'):
@@ -590,7 +653,7 @@ class WebhookHandler:
         
         # VADMetrics and EOUMetrics don't contribute to usage/latency tracking
         # but we log them for debugging
-        logger.debug("Metrics collected: %s", metrics_obj.type)
+        # logger.debug("Metrics collected: %s", metrics_obj.type)
     
     def _calculate_average_latency(self, latencies: list[float]) -> float:
         """Calculate average latency from a list of measurements."""
@@ -673,6 +736,8 @@ class WebhookHandler:
                     "lk_agent_enabled": self.is_deployed_on_lk_cloud,
                     # Phone number if available
                     "phone_number": self.phone_number,
+                    # Custom telephony rate ($/min) if provided
+                    "call_rate_usd": self.call_rate_usd,
                 },
                 "usage": self.usage_metrics,
                 "latency": avg_latency,
@@ -788,26 +853,26 @@ class WebhookHandler:
                     response_text = await response.text()
                     
                     if response.status == 200:
-                        logger.info("SPEECHIFY_WEBHOOK_SENT: %s", response_text)
+                        logger.info("SUPERBRYN_WEBHOOK_SENT: %s", response_text)
                     elif response.status == 401:
                         logger.error(
-                            "SPEECHIFY_WEBHOOK_UNAUTHORIZED: %s - Check SUPERBRYN_API_KEY",
+                            "SUPERBRYN_WEBHOOK_UNAUTHORIZED: %s - Check SUPERBRYN_API_KEY",
                             response_text,
                         )
                     elif response.status == 403:
                         logger.error(
-                            "SPEECHIFY_WEBHOOK_FORBIDDEN: %s - API key may be expired or disabled",
+                            "SUPERBRYN_WEBHOOK_FORBIDDEN: %s - API key may be expired or disabled",
                             response_text,
                         )
                     else:
                         logger.error(
-                            "SPEECHIFY_WEBHOOK_FAILED: status %s: %s",
+                            "SUPERBRYN_WEBHOOK_FAILED: status %s: %s",
                             response.status,
                             response_text,
                         )
         
         except Exception as e:  # noqa: BLE001
-            logger.error("SPEECHIFY_WEBHOOK_ERROR: %s", e, exc_info=True)
+            logger.error("SUPERBRYN_WEBHOOK_ERROR: %s", e, exc_info=True)
 
 
 def create_webhook_handler(
@@ -815,6 +880,7 @@ def create_webhook_handler(
     is_deployed_on_lk_cloud: bool,
     livekit_project_id: Optional[str] = None,
     api_key: Optional[str] = None,
+    call_rate_usd: Optional[float] = None,
 ) -> Optional[WebhookHandler]:
     """
     Factory function to create a webhook handler from environment variables.
@@ -829,6 +895,7 @@ def create_webhook_handler(
         is_deployed_on_lk_cloud: Whether agent is deployed on LiveKit Cloud ($0.014/min) - REQUIRED
         livekit_project_id: LiveKit project ID (defaults to env var or extracted from LIVEKIT_URL)
         api_key: Override API key (defaults to env var SUPERBRYN_API_KEY)
+        call_rate_usd: Custom telephony rate per minute ($/min) for cost calculation (optional)
     
     Returns:
         WebhookHandler instance or None if webhook is disabled
@@ -864,7 +931,8 @@ def create_webhook_handler(
         room=room,
         is_deployed_on_lk_cloud=is_deployed_on_lk_cloud,
         livekit_project_id=livekit_project_id,
+        call_rate_usd=call_rate_usd,
     )
     
-    logger.info("SPEECHIFY_WEBHOOK_HANDLER_CREATED: is_deployed_on_lk_cloud=%s", is_deployed_on_lk_cloud)
+    logger.info("SUPERBRYN_WEBHOOK_HANDLER_CREATED: is_deployed_on_lk_cloud=%s", is_deployed_on_lk_cloud)
     return handler
