@@ -7,6 +7,6 @@ analytics for your LiveKit voice AI agents.
 
 from .webhook_handler import WebhookHandler, create_webhook_handler
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = ["WebhookHandler", "create_webhook_handler"]
 
