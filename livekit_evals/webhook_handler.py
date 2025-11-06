@@ -10,9 +10,10 @@ import os
 import re
 import json
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import aiohttp
+from config import S3_CONFIG, is_s3_configured, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
 from livekit.agents import (
     AgentSession,
     AgentStateChangedEvent,
@@ -37,19 +38,22 @@ from livekit.agents.metrics import (
 )
 from livekit.rtc import Room
 
+if TYPE_CHECKING:
+    from recording_manager import RecordingManager
+
 logger = logging.getLogger("webhook_handler")
 
 
 def _extract_project_id_from_url(livekit_url: str) -> Optional[str]:
     """
     Extract project ID from LiveKit URL.
-    
+
     Args:
         livekit_url: LiveKit URL (e.g., "wss://tara-agent-bt2d90rn.livekit.cloud")
-    
+
     Returns:
         Project ID (e.g., "tara-agent-bt2d90rn") or None if not found
-    """    
+    """
     # Match pattern: wss://PROJECT_ID.livekit.cloud or ws://PROJECT_ID.livekit.cloud
     match = re.match(r"wss?://([^.]+)\.livekit\.cloud", livekit_url)
     if match:
@@ -84,6 +88,8 @@ class WebhookHandler:
         is_deployed_on_lk_cloud: bool,
         livekit_project_id: Optional[str] = None,
         call_rate_usd: Optional[float] = None,
+        recording_manager: Optional["RecordingManager"] = None,
+        disable_recording: bool = False,
     ):
         """
         Initialize webhook handler.
@@ -95,6 +101,8 @@ class WebhookHandler:
             is_deployed_on_lk_cloud: Whether agent is deployed on LiveKit Cloud ($0.014/min)
             livekit_project_id: LiveKit project ID for agent uniqueness (optional)
             call_rate_usd: Custom telephony rate per minute ($/min) for cost calculation (optional)
+            recording_manager: RecordingManager instance for handling recordings (optional)
+            disable_recording: Set to True to disable call recording (default: False, recording enabled)
         """
         self.webhook_url = webhook_url
         self.api_key = api_key
@@ -102,6 +110,8 @@ class WebhookHandler:
         self.is_deployed_on_lk_cloud = is_deployed_on_lk_cloud
         self.livekit_project_id = livekit_project_id
         self.call_rate_usd = call_rate_usd
+        self.recording_manager = recording_manager
+        self.disable_recording = disable_recording
         
         # These will be auto-detected
         self.agent_id: Optional[str] = None
@@ -110,6 +120,11 @@ class WebhookHandler:
         self.sip_trunking_enabled: bool = False
         self.egress_enabled: bool = False
         self.phone_number: Optional[str] = None
+        
+        # Recording URLs (set externally by RecordingManager)
+        self.recording_url: Optional[str] = None
+        self.stereo_recording_url: Optional[str] = None
+        self.egress_id: Optional[str] = None
         
         # Session tracking
         self.started_at: Optional[datetime] = None
@@ -156,6 +171,28 @@ class WebhookHandler:
             is_deployed_on_lk_cloud,
             livekit_project_id or "not-set",
         )
+    
+    def set_recording_url(
+        self,
+        recording_url: Optional[str],
+        egress_id: Optional[str] = None,
+        stereo_recording_url: Optional[str] = None,
+    ) -> None:
+        """
+        Set the recording URL for this session.
+        
+        Args:
+            recording_url: Primary recording URL
+            egress_id: LiveKit egress ID for the recording
+            stereo_recording_url: Stereo recording URL (optional)
+        """
+        self.recording_url = recording_url
+        self.egress_id = egress_id
+        self.stereo_recording_url = stereo_recording_url
+        
+        if recording_url:
+            self.egress_enabled = True
+            logger.info("Recording URL set: %s (egress_id: %s)", recording_url, egress_id)
     
     def _extract_session_config(self, session: AgentSession) -> None:
         """Extract model/provider info from session configuration using Whispey's approach."""
@@ -355,9 +392,9 @@ class WebhookHandler:
         except Exception as e:
             logger.warning("Failed to detect SIP trunking: %s", e)
     
-    def attach_to_session(self, session: AgentSession) -> None:
+    async def attach_to_session(self, session: AgentSession) -> None:
         """
-        Attach event listeners to the agent session.
+        Attach event listeners to the agent session and start recording if configured.
         
         Args:
             session: AgentSession to attach to
@@ -371,19 +408,42 @@ class WebhookHandler:
         if job_ctx and hasattr(job_ctx, 'job') and job_ctx.job and hasattr(job_ctx.job, 'metadata'):
             try:
                 metadata = json.loads(job_ctx.job.metadata) if isinstance(job_ctx.job.metadata, str) else job_ctx.job.metadata
-                self.agent_id = metadata.get('agent_id') or os.getenv('AGENT_ID', 'livekit-agent')
-                self.version_id = metadata.get('version_id') or os.getenv('VERSION_ID', 'v1')
+                self.agent_id = metadata.get('agent_id') or AGENT_CONFIG['id']
+                self.version_id = metadata.get('version_id') or AGENT_CONFIG['version_id']
                 self.phone_number = metadata.get('phone_number')
                 logger.info("Extracted from job metadata - agent_id: %s, version_id: %s, phone: %s",
                           self.agent_id, self.version_id, self.phone_number)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to extract from job metadata: %s", e)
         
-        # Fallback to environment variables if not extracted
+        # Fallback to config if not extracted from metadata
         if not self.agent_id:
-            self.agent_id = os.getenv('AGENT_ID', 'livekit-agent')
+            self.agent_id = AGENT_CONFIG['id']
         if not self.version_id:
-            self.version_id = os.getenv('VERSION_ID', 'v1')
+            self.version_id = AGENT_CONFIG['version_id']
+        
+        # Start recording unless disabled
+        if self.disable_recording:
+            logger.info("Recording disabled by disable_recording flag")
+        elif self.recording_manager:
+            try:
+                logger.info("Starting recording for room %s", self.room.name)
+                recording_url, egress_id = await self.recording_manager.start_recording(
+                    room_name=self.room.name,
+                    phone_number=self.phone_number,
+                )
+                
+                if recording_url:
+                    self.set_recording_url(
+                        recording_url=recording_url,
+                        egress_id=egress_id,
+                    )
+                    logger.info("Recording started successfully: %s", recording_url)
+                else:
+                    logger.warning("Failed to start recording")
+                    
+            except Exception as e:  # noqa: BLE001
+                logger.error("Failed to start recording: %s", e, exc_info=True)
         
         # Extract system prompt from session's current agent
         if hasattr(session, 'current_agent') and session.current_agent:
@@ -700,7 +760,7 @@ class WebhookHandler:
         
         # Filter out turns without text
         turns_with_text = [turn for turn in self.transcript_turns if turn.get("text") and turn["text"].strip()]
-        logger.info("Filtered transcript: %d total turns, %d turns with text", 
+        logger.info("Filtered transcript: %d total turns, %d turns with text",
                    len(self.transcript_turns), len(turns_with_text))
         
         # Build payload
@@ -754,11 +814,15 @@ class WebhookHandler:
     
     def _get_recording_url(self) -> str | None:
         """Get recording URL if available."""
-        # Check if room has recording info
+        # Return the recording URL set by RecordingManager
+        if self.recording_url:
+            return self.recording_url
+        
+        # Fallback: Check if room has recording info
         if hasattr(self.room, 'recording_url') and self.room.recording_url:
             return self.room.recording_url
         
-        # Check if room has recording status
+        # Fallback: Check if room has recording status
         if hasattr(self.room, 'recording_status') and self.room.recording_status:
             # Try to construct URL from room name and LiveKit project
             if self.livekit_project_id and self.livekit_project_id != "not-set":
@@ -768,7 +832,11 @@ class WebhookHandler:
     
     def _get_stereo_recording_url(self) -> str | None:
         """Get stereo recording URL if available."""
-        # Check if room has stereo recording info
+        # Return the stereo recording URL set by RecordingManager
+        if self.stereo_recording_url:
+            return self.stereo_recording_url
+        
+        # Fallback: Check if room has stereo recording info
         if hasattr(self.room, 'stereo_recording_url') and self.room.stereo_recording_url:
             return self.room.stereo_recording_url
         
@@ -813,17 +881,21 @@ class WebhookHandler:
         
         This should be called when the session ends.
         Authenticates using API key from parameter or environment (SUPERBRYN_API_KEY).
+        Cleans up recording resources after sending webhook.
         
         Args:
             api_key_override: Optional API key to override environment variable
         """
         try:
-            # Detect egress enabled from recording URL availability
-            recording_url = self._get_recording_url()
-            if recording_url:
-                self.egress_enabled = True
-                logger.info("Egress recording detected from recording URL")
+            # Clean up recording resources first
+            if self.recording_manager:
+                try:
+                    await self.recording_manager.stop_recording()
+                    logger.info("Recording manager cleanup completed")
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Error during recording cleanup: %s", e, exc_info=True)
             
+            # Build webhook payload (egress_enabled is set by set_recording_url if recording is active)
             payload = self._build_webhook_payload()
             
             # Get API key from parameter or environment
@@ -881,12 +953,16 @@ def create_webhook_handler(
     livekit_project_id: Optional[str] = None,
     api_key: Optional[str] = None,
     call_rate_usd: Optional[float] = None,
+    disable_recording: bool = False,
 ) -> Optional[WebhookHandler]:
     """
     Factory function to create a webhook handler from environment variables.
     
     Auto-detects agent_id, version_id, system_prompt, phone_number, SIP trunking,
     and egress recording from session context and room participants.
+    
+    Recording is ENABLED by default using SuperBryn's S3 credentials.
+    S3 credentials in config.py are optional - only needed if you want to use your own bucket.
     
     Requires SUPERBRYN_API_KEY in environment or as parameter for webhook authentication.
     
@@ -896,21 +972,22 @@ def create_webhook_handler(
         livekit_project_id: LiveKit project ID (defaults to env var or extracted from LIVEKIT_URL)
         api_key: Override API key (defaults to env var SUPERBRYN_API_KEY)
         call_rate_usd: Custom telephony rate per minute ($/min) for cost calculation (optional)
+        disable_recording: Set to True to disable call recording (default: False, recording enabled)
     
     Returns:
         WebhookHandler instance or None if webhook is disabled
     """
-    # Get configuration from environment
-    webhook_url = "https://riaahcilmtirmkoulgjy.supabase.co/functions/v1/webhooks-livekit"
-    livekit_project_id = livekit_project_id or os.getenv("LIVEKIT_PROJECT_ID")
+    # Get configuration from config.py (with parameter overrides)
+    webhook_url = WEBHOOK_CONFIG["url"]
+    livekit_project_id = livekit_project_id or LIVEKIT_CONFIG["project_id"]
     
-    # Check for API key (parameter override, then environment variable)
-    resolved_api_key = api_key or os.getenv("SUPERBRYN_API_KEY")
+    # Check for API key (parameter override, then config)
+    resolved_api_key = api_key or WEBHOOK_CONFIG["api_key"]
     if not resolved_api_key:
-        logger.warning("SUPERBRYN_API_KEY not configured and no api_key provided, webhook disabled")
+        logger.warning("SUPERBRYN_API_KEY not configured in config.py, webhook disabled")
         return None
     
-    # If project ID not explicitly set, try to extract from LIVEKIT_URL, LIVEKIT_WS_URL, or LIVEKIT_WSS_URL
+    # If project ID not explicitly set, try to extract from LIVEKIT_URL
     if not livekit_project_id:
         livekit_url = os.getenv("LIVEKIT_URL") or os.getenv("LIVEKIT_WS_URL") or os.getenv("LIVEKIT_WSS_URL")
         if livekit_url:
@@ -923,6 +1000,28 @@ def create_webhook_handler(
         logger.warning("WEBHOOK_URL not configured, webhook disabled")
         return None
     
+    # Initialize recording manager (always available with SuperBryn's default S3 credentials)
+    recording_manager = None
+    
+    if disable_recording:
+        logger.info("Recording disabled by disable_recording=True flag")
+    elif is_s3_configured():
+        try:
+            from recording_manager import RecordingManager
+            recording_manager = RecordingManager(
+                s3_bucket=S3_CONFIG["bucket_name"],
+                s3_region=S3_CONFIG["region"],
+                s3_access_key=S3_CONFIG["access_key"],
+                s3_secret_key=S3_CONFIG["secret_key"],
+                s3_base_url=S3_CONFIG["base_url"],
+            )
+            logger.info("Recording manager initialized - using configured S3 bucket: %s", S3_CONFIG["bucket_name"])
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to initialize recording manager: %s", e, exc_info=True)
+            logger.warning("Continuing without recording functionality")
+    else:
+        logger.warning("S3 credentials not configured - this should not happen with default config")
+    
     # Create handler - agent_id, version_id, system_prompt, phone_number, sip_trunking, and egress
     # will be auto-detected in attach_to_session and send_webhook
     handler = WebhookHandler(
@@ -932,7 +1031,10 @@ def create_webhook_handler(
         is_deployed_on_lk_cloud=is_deployed_on_lk_cloud,
         livekit_project_id=livekit_project_id,
         call_rate_usd=call_rate_usd,
+        recording_manager=recording_manager,
+        disable_recording=disable_recording,
     )
     
-    logger.info("SUPERBRYN_WEBHOOK_HANDLER_CREATED: is_deployed_on_lk_cloud=%s", is_deployed_on_lk_cloud)
+    logger.info("SUPERBRYN_WEBHOOK_HANDLER_CREATED: is_deployed_on_lk_cloud=%s, recording=%s",
+               is_deployed_on_lk_cloud, "disabled" if disable_recording else ("enabled" if recording_manager else "unavailable"))
     return handler
