@@ -24,7 +24,7 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 
 ### Prerequisites
 
-1. **Get your API key** from [https://app.superbryn.com/api-keys](https://app.superbryn.com/api-keys) *(placeholder)*
+1. **Get your API key** from [https://app.superbryn.com/api-keys](https://app.superbryn.com/api-keys)
 2. **Set environment variable:**
    ```bash
    export SUPERBRYN_API_KEY=your_api_key_here
