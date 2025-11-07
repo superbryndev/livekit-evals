@@ -422,6 +422,11 @@ class WebhookHandler:
         if not self.version_id:
             self.version_id = AGENT_CONFIG['version_id']
         
+        # Ensure agent_id is never None or empty (required by webhook endpoint)
+        if not self.agent_id:
+            self.agent_id = "livekit-agent-default"
+            logger.warning("agent_id not configured - using fallback: %s", self.agent_id)
+        
         # Start recording unless disabled
         if self.disable_recording:
             logger.info("Recording disabled by disable_recording flag")
@@ -762,6 +767,11 @@ class WebhookHandler:
         turns_with_text = [turn for turn in self.transcript_turns if turn.get("text") and turn["text"].strip()]
         logger.info("Filtered transcript: %d total turns, %d turns with text",
                    len(self.transcript_turns), len(turns_with_text))
+        
+        # Ensure agent_id is set (required by webhook endpoint)
+        if not self.agent_id:
+            self.agent_id = "livekit-agent-default"
+            logger.error("agent_id was None when building webhook payload - using fallback: %s", self.agent_id)
         
         # Build payload
         payload = {
