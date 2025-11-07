@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
 import aiohttp
-from config import S3_CONFIG, is_s3_configured, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
+from .config import S3_CONFIG, is_s3_configured, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
 from livekit.agents import (
     AgentSession,
     AgentStateChangedEvent,
