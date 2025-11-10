@@ -63,7 +63,7 @@ async def entrypoint(ctx: JobContext):
     # ... your session setup ...
     await session.start(agent=YourAgent(), room=ctx.room)
     
-    # 2. Attach to session (MUST be after session.start, before ctx.connect)
+    # 2. Attach to session (MUST be after session.start)
     if webhook_handler:
         webhook_handler.attach_to_session(session)
         # 3. Send webhook on shutdown
@@ -127,7 +127,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(agent=Assistant(), room=ctx.room)
 
     # Attach webhook handler to capture events
-    # IMPORTANT: Must be after session.start() and before ctx.connect()
+    # IMPORTANT: Must be after session.start()
     if webhook_handler:
         webhook_handler.attach_to_session(session)
         ctx.add_shutdown_callback(webhook_handler.send_webhook)
@@ -484,7 +484,6 @@ logging.basicConfig(level=logging.DEBUG)
 
 Ensure `webhook_handler.attach_to_session(session)` is called:
 - ✅ **After** `await session.start()`
-- ✅ **Before** `await ctx.connect()`
 - ✅ At the **end** of your entrypoint (no early returns)
 
 ### Provider Detection Issues
@@ -560,7 +559,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [LiveKit Agents Documentation](https://docs.livekit.io/agents/)
 - [GitHub Repository](https://github.com/superbryndev/livekit-evals)
 - [Issue Tracker](https://github.com/superbryndev/livekit-evals/issues)
-- [Get API Key](https://your-platform.com/api-keys) *(placeholder)*
+- [Get API Key](https://app.superbryn.com/api-keys)
 
 ## 💡 Support
 
