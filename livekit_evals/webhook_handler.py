@@ -10,10 +10,9 @@ import os
 import re
 import json
 from datetime import datetime, timezone
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Optional
 
 import aiohttp
-from .config import S3_CONFIG, is_s3_configured, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
 from livekit.agents import (
     AgentSession,
     AgentStateChangedEvent,
@@ -38,8 +37,8 @@ from livekit.agents.metrics import (
 )
 from livekit.rtc import Room
 
-if TYPE_CHECKING:
-    from recording_manager import RecordingManager
+from .config import S3_CONFIG, is_s3_configured, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
+from .recording_manager import RecordingManager
 
 logger = logging.getLogger("webhook_handler")
 
@@ -206,7 +205,13 @@ class WebhookHandler:
                     self.usage_metrics["llm_model"] = llm_obj.model
                 
                 # Extract provider from module name
-                provider_name = llm_obj.__module__.split('.')[-1]
+                # Check if it's a plugin (livekit.plugins.X.llm) and extract X
+                module_path = llm_obj.__module__
+                if 'livekit.plugins.' in module_path:
+                    # Extract plugin name from livekit.plugins.PROVIDER.llm
+                    provider_name = module_path.split('.')[2] if len(module_path.split('.')) > 2 else module_path.split('.')[-1]
+                else:
+                    provider_name = module_path.split('.')[-1]
                 self.usage_metrics["llm_provider"] = provider_name
                 
                 # Also try to extract from _opts if available
@@ -224,7 +229,13 @@ class WebhookHandler:
                     self.usage_metrics["stt_model"] = stt_obj.model
                 
                 # Extract provider from module name
-                provider_name = stt_obj.__module__.split('.')[-1]
+                # Check if it's a plugin (livekit.plugins.X.stt) and extract X
+                module_path = stt_obj.__module__
+                if 'livekit.plugins.' in module_path:
+                    # Extract plugin name from livekit.plugins.PROVIDER.stt
+                    provider_name = module_path.split('.')[2] if len(module_path.split('.')) > 2 else module_path.split('.')[-1]
+                else:
+                    provider_name = module_path.split('.')[-1]
                 self.usage_metrics["stt_provider"] = provider_name
                 
                 # Also try to extract from _opts if available
@@ -232,6 +243,10 @@ class WebhookHandler:
                     opts = stt_obj._opts
                     if hasattr(opts, 'model') and not self.usage_metrics["stt_model"]:
                         self.usage_metrics["stt_model"] = opts.model
+                    
+                    # Speechmatics uses operating_point instead of model
+                    if hasattr(opts, 'operating_point') and not self.usage_metrics["stt_model"]:
+                        self.usage_metrics["stt_model"] = opts.operating_point
             
             # Extract TTS info
             if hasattr(session, 'tts') and session.tts:
@@ -248,7 +263,13 @@ class WebhookHandler:
                     self.usage_metrics["tts_model"] = tts_obj.model
                 
                 # Extract provider from module name
-                provider_name = tts_obj.__module__.split('.')[-1]
+                # Check if it's a plugin (livekit.plugins.X.tts) and extract X
+                module_path = tts_obj.__module__
+                if 'livekit.plugins.' in module_path:
+                    # Extract plugin name from livekit.plugins.PROVIDER.tts
+                    provider_name = module_path.split('.')[2] if len(module_path.split('.')) > 2 else module_path.split('.')[-1]
+                else:
+                    provider_name = module_path.split('.')[-1]
                 self.usage_metrics["tts_provider"] = provider_name
                 
                 # Also try to extract from _opts if available
@@ -367,7 +388,7 @@ class WebhookHandler:
             return 'unknown'
     
     def _detect_sip_trunking(self) -> None:
-        """Detect if SIP trunking is enabled by checking for SIP participants."""
+        """Detect if SIP trunking is enabled by checking for SIP participants and extract phone number."""
         try:
             for participant in self.room.remote_participants.values():
                 # Check if participant has SIP-related attributes
@@ -377,6 +398,12 @@ class WebhookHandler:
                     if any(key.startswith('sip.') for key in attributes.keys()):
                         self.sip_trunking_enabled = True
                         logger.info("SIP trunking detected from participant attributes")
+                        
+                        # Extract phone number from sip.phoneNumber attribute if available
+                        if 'sip.phoneNumber' in attributes and not self.phone_number:
+                            self.phone_number = attributes['sip.phoneNumber']
+                            logger.info("Extracted phone number from SIP attributes: %s", self.phone_number)
+                        
                         return
                 
                 # Also check participant identity for SIP patterns
@@ -386,6 +413,12 @@ class WebhookHandler:
                     if identity and (identity.startswith('+') or identity.startswith('sip:')):
                         self.sip_trunking_enabled = True
                         logger.info("SIP trunking detected from participant identity: %s", identity)
+                        
+                        # Extract phone number from identity if not already set
+                        if not self.phone_number and identity.startswith('+'):
+                            self.phone_number = identity
+                            logger.info("Extracted phone number from participant identity: %s", self.phone_number)
+                        
                         return
             
             logger.info("No SIP participants detected, SIP trunking disabled")
@@ -1017,7 +1050,6 @@ def create_webhook_handler(
         logger.info("Recording disabled by disable_recording=True flag")
     elif is_s3_configured():
         try:
-            from recording_manager import RecordingManager
             recording_manager = RecordingManager(
                 s3_bucket=S3_CONFIG["bucket_name"],
                 s3_region=S3_CONFIG["region"],
