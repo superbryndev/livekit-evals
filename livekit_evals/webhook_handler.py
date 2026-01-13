@@ -555,16 +555,69 @@ class WebhookHandler:
         logger.debug("Transcript turn text updated: %s - %s...", speaker, text[:500])
     
     def _on_user_input_transcribed(self, event: UserInputTranscribedEvent) -> None:
-        """Handle user input transcribed event for additional metadata."""
-        # This gives us language and speaker_id if available
-        if self.transcript_turns and event.is_final:
-            # Update the last user turn with additional metadata
-            for turn in reversed(self.transcript_turns):
-                if turn["speaker"] == "user":
-                    turn["language"] = event.language
-                    if event.speaker_id:
-                        turn["speaker_id"] = event.speaker_id
-                    break
+        """Handle user input transcribed event (final STT text + metadata).
+
+        NOTE: Some LiveKit agent flows emit user STT via this event but do NOT emit a
+        corresponding user ChatMessage via conversation_item_added. If we don't copy
+        event.transcript into the most recent user turn, the webhook payload will
+        drop user turns (because we filter out turns with empty text).
+        """
+        if not event.is_final:
+            return
+
+        transcript_text = getattr(event, "transcript", None)
+        if transcript_text is None:
+            # Defensive fallback for any SDK shape differences
+            transcript_text = getattr(event, "text", None)
+        transcript_text = (transcript_text or "").strip()
+
+        # Find the most recent user turn without text and fill it in.
+        target_turn = None
+        for turn in reversed(self.transcript_turns):
+            if turn.get("speaker") == "user" and not (turn.get("text") or "").strip():
+                target_turn = turn
+                break
+
+        # Fallback: if we didn't observe a user_state_changed start turn (rare),
+        # append a minimal user turn so we don't lose the transcript entirely.
+        if target_turn is None:
+            current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            state_time_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else 0
+            timestamp = datetime.now(timezone.utc).isoformat()
+            target_turn = {
+                "speaker": "user",
+                "text": "",
+                "timestamp": timestamp,
+                "start_timestamp": timestamp,
+                "end_timestamp": timestamp,
+                "start_time_ms": state_time_ms,
+                "end_time_ms": state_time_ms,
+                "response_delay_ms": None,
+                "interrupted": False,
+                "turn_latency": None,
+                "confidence_score": None,
+                "language": None,
+                "speaker_id": None,
+            }
+            self.transcript_turns.append(target_turn)
+
+        # Fill in text from STT if we have it and the turn is empty.
+        if transcript_text and not (target_turn.get("text") or "").strip():
+            target_turn["text"] = transcript_text
+            target_turn["turn_latency"] = self._get_turn_latency("user")
+
+            # Keep response_delay computation consistent with conversation_item_added path
+            self.last_user_turn_time_ms = (
+                target_turn.get("end_time_ms") if target_turn.get("end_time_ms") is not None else target_turn.get("start_time_ms")
+            )
+
+            logger.info("✓ Filled text for user turn from STT: %s...", transcript_text[:500])
+
+        # Always store metadata if available
+        target_turn["language"] = getattr(event, "language", None)
+        speaker_id = getattr(event, "speaker_id", None)
+        if speaker_id:
+            target_turn["speaker_id"] = speaker_id
     
     def _on_agent_state_changed(self, event: AgentStateChangedEvent) -> None:
         """Handle agent state changes for precise timing."""
