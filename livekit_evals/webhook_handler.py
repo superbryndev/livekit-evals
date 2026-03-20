@@ -128,6 +128,8 @@ class WebhookHandler:
         # Session tracking
         self.started_at: Optional[datetime] = None
         self.ended_at: Optional[datetime] = None
+        self.ring_started_at: Optional[datetime] = None
+        self.call_end_reason: Optional[str] = None
         
         # Transcript tracking
         self.transcript_turns: list[dict[str, Any]] = []
@@ -435,6 +437,12 @@ class WebhookHandler:
         # Mark session start
         self.started_at = datetime.now(timezone.utc)
         self.call_start_time_ms = int(self.started_at.timestamp() * 1000)
+        
+        # Capture room creation time as ring_started_at (when the call was initiated)
+        try:
+            self.ring_started_at = self.room.creation_time
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to get room.creation_time: %s", e)
         
         # Extract agent_id, version_id, and phone_number from job context if available
         job_ctx = get_job_context()
@@ -745,6 +753,12 @@ class WebhookHandler:
             if event.error:
                 logger.error("Session closed with error: %s", event.error)
             
+            # Capture end reason
+            if hasattr(event, 'reason') and event.reason is not None:
+                self.call_end_reason = event.reason.value if hasattr(event.reason, 'value') else str(event.reason)
+            elif event.error:
+                self.call_end_reason = "error"
+            
             # Mark session as ended
             self.ended_at = datetime.now(timezone.utc)
             
@@ -866,9 +880,11 @@ class WebhookHandler:
                 "id": self.room.name,  # Use room name as call ID
                 "room_name": self.room.name,
                 "participant_identity": self._get_participant_identity(),
+                "ring_started_at": self.ring_started_at.isoformat() if self.ring_started_at else None,
                 "started_at": self.started_at.isoformat() if self.started_at else None,
                 "ended_at": self.ended_at.isoformat() if self.ended_at else None,
                 "duration_seconds": duration_seconds,
+                "call_end_reason": self.call_end_reason,
                 "transcript": {
                     "turns": turns_with_text,
                 },
