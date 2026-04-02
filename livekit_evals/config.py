@@ -1,34 +1,25 @@
 """
 Configuration file for LiveKit Evals
 
-Contains hardcoded default values that can be overridden by environment variables.
-
-IMPORTANT: Call recording is ENABLED by default using SuperBryn's S3 credentials.
-Override S3 settings only if you want to use your own bucket.
+Contains default values that can be overridden by environment variables.
+Recording credentials are fetched at runtime from a secure endpoint using
+the SUPERBRYN_API_KEY -- no S3 keys are stored in this package.
 """
 
 import os
 
 # =============================================================================
-# S3 Recording Configuration
+# Recording Credentials Configuration
 # =============================================================================
-# Recording is ENABLED by default using SuperBryn's S3 credentials below.
-# You can override with your own S3 bucket by changing these values or setting env vars.
-#
-# To use your own S3 bucket, see: S3_SETUP_INSTRUCTIONS.md
+# Temporary S3 credentials are fetched per-session from this endpoint.
+# The SUPERBRYN_API_KEY is used to authenticate the request.
 
-_DEFAULT_S3_BUCKET = "superbryn-call-recordings"  # SuperBryn's default bucket
-_DEFAULT_S3_REGION = "ap-south-1"
-_DEFAULT_S3_ACCESS_KEY = "AKIAUOZE37VAU3LB2RVS"  # SuperBryn's write-only credentials
-_DEFAULT_S3_SECRET_KEY = "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"  # SuperBryn's write-only credentials
-_DEFAULT_S3_BASE_URL = f"https://{_DEFAULT_S3_BUCKET}.s3.{_DEFAULT_S3_REGION}.amazonaws.com"
+_DEFAULT_CREDENTIALS_URL = (
+    "https://orchestration-service-v2.onrender.com/api/recording-credentials"
+)
 
-S3_CONFIG = {
-    "bucket_name": os.getenv("S3_BUCKET_NAME", _DEFAULT_S3_BUCKET),
-    "region": os.getenv("S3_REGION", _DEFAULT_S3_REGION),
-    "access_key": os.getenv("S3_ACCESS_KEY", _DEFAULT_S3_ACCESS_KEY),
-    "secret_key": os.getenv("S3_SECRET_KEY", _DEFAULT_S3_SECRET_KEY),
-    "base_url": os.getenv("S3_BASE_URL", _DEFAULT_S3_BASE_URL),
+CREDENTIALS_CONFIG = {
+    "url": os.getenv("SUPERBRYN_CREDENTIALS_URL", _DEFAULT_CREDENTIALS_URL),
 }
 
 # =============================================================================
@@ -57,22 +48,10 @@ LIVEKIT_CONFIG = {
 # =============================================================================
 # Webhook Configuration
 # =============================================================================
-_DEFAULT_WEBHOOK_URL = "https://riaahcilmtirmkoulgjy.supabase.co/functions/v1/webhooks-livekit"
-_DEFAULT_WEBHOOK_API_KEY = ""  # ← SET YOUR DEFAULT API KEY HERE
+_DEFAULT_WEBHOOK_URL = "https://orchestration-service-v2.onrender.com/webhooks/livekit"
+_DEFAULT_WEBHOOK_API_KEY = ""
 
 WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", _DEFAULT_WEBHOOK_URL),
     "api_key": os.getenv("SUPERBRYN_API_KEY", _DEFAULT_WEBHOOK_API_KEY),
 }
-
-
-def is_s3_configured() -> bool:
-    """Check if S3 credentials are properly configured for recording"""
-    return bool(
-        S3_CONFIG["bucket_name"]
-        and S3_CONFIG["region"]
-        and S3_CONFIG["access_key"]
-        and S3_CONFIG["secret_key"]
-        and S3_CONFIG["base_url"]
-    )
-

@@ -37,7 +37,7 @@ from livekit.agents.metrics import (
 )
 from livekit.rtc import Room
 
-from .config import S3_CONFIG, is_s3_configured, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
+from .config import CREDENTIALS_CONFIG, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
 from .recording_manager import RecordingManager
 
 logger = logging.getLogger("webhook_handler")
@@ -1073,8 +1073,8 @@ def create_webhook_handler(
     Auto-detects agent_id, version_id, system_prompt, phone_number, SIP trunking,
     and egress recording from session context and room participants.
     
-    Recording is ENABLED by default using SuperBryn's S3 credentials.
-    S3 credentials in config.py are optional - only needed if you want to use your own bucket.
+    Recording is ENABLED by default. Temporary S3 credentials are fetched
+    per-session using the SUPERBRYN_API_KEY -- no S3 keys need to be configured.
     
     Requires SUPERBRYN_API_KEY in environment or as parameter for webhook authentication.
     
@@ -1112,26 +1112,20 @@ def create_webhook_handler(
         logger.warning("WEBHOOK_URL not configured, webhook disabled")
         return None
     
-    # Initialize recording manager (always available with SuperBryn's default S3 credentials)
     recording_manager = None
-    
+
     if disable_recording:
         logger.info("Recording disabled by disable_recording=True flag")
-    elif is_s3_configured():
+    else:
         try:
             recording_manager = RecordingManager(
-                s3_bucket=S3_CONFIG["bucket_name"],
-                s3_region=S3_CONFIG["region"],
-                s3_access_key=S3_CONFIG["access_key"],
-                s3_secret_key=S3_CONFIG["secret_key"],
-                s3_base_url=S3_CONFIG["base_url"],
+                credentials_url=CREDENTIALS_CONFIG["url"],
+                api_key=resolved_api_key,
             )
-            logger.info("Recording manager initialized - using configured S3 bucket: %s", S3_CONFIG["bucket_name"])
+            logger.info("Recording manager initialized (credentials fetched per-session)")
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to initialize recording manager: %s", e, exc_info=True)
             logger.warning("Continuing without recording functionality")
-    else:
-        logger.warning("S3 credentials not configured - this should not happen with default config")
     
     # Create handler - agent_id, version_id, system_prompt, phone_number, sip_trunking, and egress
     # will be auto-detected in attach_to_session and send_webhook

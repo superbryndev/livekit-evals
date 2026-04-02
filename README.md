@@ -17,8 +17,8 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 - 🔍 **Auto-Detection** - Automatically extracts models, providers, and configuration
 - 📞 **SIP Support** - Detects SIP trunking and phone numbers
 - 🎥 **Recording URLs** - Captures egress recording links
-- 🎙️ **S3 Recordings** - Automatic call recording to S3 (MP3 format, enabled by default)
-- 🔐 **Secure** - API key authentication with webhook delivery
+- 🎙️ **Call Recordings** - Automatic call recording to S3 (MP3 format, enabled by default, no S3 config needed)
+- 🔐 **Secure** - API key authentication; temporary S3 credentials fetched per-session
 
 ## 🚀 Quick Start
 
@@ -146,17 +146,12 @@ if __name__ == "__main__":
 
 | Variable | Required | Description | Default |
 |----------|----------|-------------|---------|
-| `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication | - |
+| `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication and call recording | - |
 | `LIVEKIT_PROJECT_ID` | ⚪ Optional | LiveKit project ID | Auto-detected from `LIVEKIT_URL` |
 | `AGENT_ID` | ⚪ Optional | Unique agent identifier | Auto-detected from job metadata or `"livekit-agent"` |
 | `VERSION_ID` | ⚪ Optional | Agent version identifier | Auto-detected from job metadata or `"v1"` |
-| `S3_BUCKET_NAME` | ⚪ Optional | Override default S3 bucket | `"superbryn-call-recordings"` |
-| `S3_REGION` | ⚪ Optional | Override AWS region | `"ap-south-1"` |
-| `S3_ACCESS_KEY` | ⚪ Optional | Override S3 access key | SuperBryn credentials |
-| `S3_SECRET_KEY` | ⚪ Optional | Override S3 secret key | SuperBryn credentials |
-| `S3_BASE_URL` | ⚪ Optional | Override base URL for recordings | Auto-generated from bucket |
 
-**Note:** Call recording is **enabled by default** using SuperBryn's S3 bucket. Override these variables only if you want to use your own S3 bucket.
+**Note:** Call recording is **enabled by default**. Temporary S3 credentials are fetched automatically using your `SUPERBRYN_API_KEY` -- no S3 configuration needed.
 
 ### Setting Environment Variables
 
@@ -361,13 +356,18 @@ This overrides default provider costs and ensures accurate cost tracking for you
 
 ### Call Recording (Enabled by Default)
 
-Call recording is **automatically enabled** using SuperBryn's S3 bucket. Recordings are:
+Call recording is **automatically enabled**. Recordings are:
 - ✅ MP3 format (universal compatibility)
 - ✅ Publicly accessible via direct URL
-- ✅ Stored securely with write-only credentials
+- ✅ Secured with short-lived credentials (30-minute expiry, scoped per session)
 - ✅ Automatically included in webhook payload
 
+No S3 keys, buckets, or regions need to be configured -- the package fetches
+temporary upload credentials from SuperBryn's credentials service using your
+`SUPERBRYN_API_KEY`.
+
 **Recording URLs** are included in the webhook payload:
+
 ```json
 {
   "call": {
@@ -377,6 +377,7 @@ Call recording is **automatically enabled** using SuperBryn's S3 bucket. Recordi
 ```
 
 **To disable recording:**
+
 ```python
 webhook_handler = create_webhook_handler(
     room=ctx.room,
@@ -384,55 +385,6 @@ webhook_handler = create_webhook_handler(
     disable_recording=True  # Disable call recording
 )
 ```
-
-**To use your own S3 bucket** (optional), edit `livekit_evals/config.py`:
-
-```python
-# livekit_evals/config.py
-_DEFAULT_S3_BUCKET = "your-bucket-name"
-_DEFAULT_S3_REGION = "us-east-1"
-_DEFAULT_S3_ACCESS_KEY = "your-access-key"
-_DEFAULT_S3_SECRET_KEY = "your-secret-key"
-```
-
-**S3 Setup Guide** (only if using your own bucket):
-
-1. **Create S3 Bucket** with public read access
-2. **Create IAM User** with write-only permissions:
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Action": ["s3:PutObject", "s3:PutObjectAcl"],
-         "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
-       },
-       {
-         "Effect": "Deny",
-         "Action": ["s3:GetObject", "s3:GetObjectAcl", "s3:GetObjectVersion", "s3:ListBucket"],
-         "Resource": [
-           "arn:aws:s3:::YOUR_BUCKET_NAME",
-           "arn:aws:s3:::YOUR_BUCKET_NAME/*"
-         ]
-       }
-     ]
-   }
-   ```
-3. **Add Bucket Policy** for public read (no listing):
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Principal": "*",
-         "Action": "s3:GetObject",
-         "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
-       }
-     ]
-   }
-   ```
 
 ### Passing Metadata via Job Context
 
