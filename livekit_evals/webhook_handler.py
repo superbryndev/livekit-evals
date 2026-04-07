@@ -89,6 +89,7 @@ class WebhookHandler:
         call_rate_usd: Optional[float] = None,
         recording_manager: Optional["RecordingManager"] = None,
         disable_recording: bool = False,
+        stereo_recording: bool = False,
     ):
         """
         Initialize webhook handler.
@@ -102,6 +103,8 @@ class WebhookHandler:
             call_rate_usd: Custom telephony rate per minute ($/min) for cost calculation (optional)
             recording_manager: RecordingManager instance for handling recordings (optional)
             disable_recording: Set to True to disable call recording (default: False, recording enabled)
+            stereo_recording: If True, record in dual-channel stereo (L=agent, R=others).
+                Implies recording is enabled (overrides disable_recording).
         """
         self.webhook_url = webhook_url
         self.api_key = api_key
@@ -111,6 +114,7 @@ class WebhookHandler:
         self.call_rate_usd = call_rate_usd
         self.recording_manager = recording_manager
         self.disable_recording = disable_recording
+        self.stereo_recording = stereo_recording
         
         # These will be auto-detected
         self.agent_id: Optional[str] = None
@@ -194,6 +198,15 @@ class WebhookHandler:
         if recording_url:
             self.egress_enabled = True
             logger.info("Recording URL set: %s (egress_id: %s)", recording_url, egress_id)
+    
+    async def stop_egress(self) -> None:
+        """Stop the active egress so the recording file is finalised on S3.
+
+        Call this **before** deleting the room. Safe to call even if no
+        recording is active (no-op in that case).
+        """
+        if self.recording_manager:
+            await self.recording_manager.stop_egress()
     
     def _extract_session_config(self, session: AgentSession) -> None:
         """Extract model/provider info from session configuration using Whispey's approach."""
@@ -469,11 +482,12 @@ class WebhookHandler:
             logger.warning("agent_id not configured - using fallback: %s", self.agent_id)
         
         # Start recording unless disabled
-        if self.disable_recording:
+        if self.disable_recording and not self.stereo_recording:
             logger.info("Recording disabled by disable_recording flag")
         elif self.recording_manager:
             try:
-                logger.info("Starting recording for room %s", self.room.name)
+                mode = "stereo" if self.stereo_recording else "mono"
+                logger.info("Starting %s recording for room %s", mode, self.room.name)
                 recording_url, egress_id = await self.recording_manager.start_recording(
                     room_name=self.room.name,
                     phone_number=self.phone_number,
@@ -483,8 +497,9 @@ class WebhookHandler:
                     self.set_recording_url(
                         recording_url=recording_url,
                         egress_id=egress_id,
+                        stereo_recording_url=recording_url if self.stereo_recording else None,
                     )
-                    logger.info("Recording started successfully: %s", recording_url)
+                    logger.info("Recording started successfully (%s): %s", mode, recording_url)
                 else:
                     logger.warning("Failed to start recording")
                     
@@ -1066,6 +1081,7 @@ def create_webhook_handler(
     api_key: Optional[str] = None,
     call_rate_usd: Optional[float] = None,
     disable_recording: bool = False,
+    stereo_recording: bool = False,
 ) -> Optional[WebhookHandler]:
     """
     Factory function to create a webhook handler from environment variables.
@@ -1076,6 +1092,11 @@ def create_webhook_handler(
     Recording is ENABLED by default. Temporary S3 credentials are fetched
     per-session using the SUPERBRYN_API_KEY -- no S3 keys need to be configured.
     
+    When ``stereo_recording=True``, the egress uses ``DUAL_CHANNEL_AGENT`` audio
+    mixing which places the agent on the left channel and all other participants
+    on the right channel. This also auto-populates ``stereo_recording_url`` in
+    the webhook payload.
+    
     Requires SUPERBRYN_API_KEY in environment or as parameter for webhook authentication.
     
     Args:
@@ -1085,6 +1106,8 @@ def create_webhook_handler(
         api_key: Override API key (defaults to env var SUPERBRYN_API_KEY)
         call_rate_usd: Custom telephony rate per minute ($/min) for cost calculation (optional)
         disable_recording: Set to True to disable call recording (default: False, recording enabled)
+        stereo_recording: If True, record in dual-channel stereo (L=agent, R=others).
+            Implies recording is enabled (overrides disable_recording).
     
     Returns:
         WebhookHandler instance or None if webhook is disabled
@@ -1113,22 +1136,22 @@ def create_webhook_handler(
         return None
     
     recording_manager = None
+    should_record = stereo_recording or not disable_recording
 
-    if disable_recording:
+    if not should_record:
         logger.info("Recording disabled by disable_recording=True flag")
     else:
         try:
             recording_manager = RecordingManager(
                 credentials_url=CREDENTIALS_CONFIG["url"],
                 api_key=resolved_api_key,
+                stereo=stereo_recording,
             )
             logger.info("Recording manager initialized (credentials fetched per-session)")
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to initialize recording manager: %s", e, exc_info=True)
             logger.warning("Continuing without recording functionality")
     
-    # Create handler - agent_id, version_id, system_prompt, phone_number, sip_trunking, and egress
-    # will be auto-detected in attach_to_session and send_webhook
     handler = WebhookHandler(
         webhook_url=webhook_url,
         api_key=resolved_api_key,
@@ -1138,8 +1161,10 @@ def create_webhook_handler(
         call_rate_usd=call_rate_usd,
         recording_manager=recording_manager,
         disable_recording=disable_recording,
+        stereo_recording=stereo_recording,
     )
     
+    mode = "stereo" if stereo_recording else ("disabled" if not should_record else ("enabled" if recording_manager else "unavailable"))
     logger.info("SUPERBRYN_WEBHOOK_HANDLER_CREATED: is_deployed_on_lk_cloud=%s, recording=%s",
-               is_deployed_on_lk_cloud, "disabled" if disable_recording else ("enabled" if recording_manager else "unavailable"))
+               is_deployed_on_lk_cloud, mode)
     return handler

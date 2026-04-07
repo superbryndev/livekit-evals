@@ -3,6 +3,9 @@ Recording Manager for LiveKit Agent
 
 Manages call recording using LiveKit Egress API with S3 storage.
 Provides recording URLs that can be accessed after the call ends.
+
+Supports mono (default) and stereo dual-channel recording where the agent
+audio is placed on the left channel and non-agent participants on the right.
 """
 
 import asyncio
@@ -23,22 +26,31 @@ RECORDING_FORMAT = egress_proto.EncodedFileType.MP3
 
 
 class RecordingManager:
-    """Manages call recording using LiveKit Egress API"""
+    """Manages call recording using LiveKit Egress API.
 
-    def __init__(self, credentials_url: str, api_key: str):
-        """Initialize the recording manager
+    When ``stereo=True``, the egress uses ``DUAL_CHANNEL_AGENT`` audio mixing
+    which places the agent participant on the left channel and all other
+    participants (e.g. SIP caller / main agent) on the right channel.
+    """
+
+    def __init__(self, credentials_url: str, api_key: str, *, stereo: bool = False):
+        """Initialize the recording manager.
 
         Args:
             credentials_url: URL of the endpoint that issues temporary S3 credentials
             api_key: SuperBryn API key used to authenticate the credentials request
+            stereo: If True, record in dual-channel stereo (L=agent, R=others)
         """
         self.credentials_url = credentials_url
         self.api_key = api_key
+        self.stereo = stereo
         self.lkapi = api.LiveKitAPI()
+        self.egress_id: Optional[str] = None
         self.recording_active = asyncio.Event()
         self.recording_active.set()
 
-        logger.info("RecordingManager initialized (credentials fetched per-session)")
+        mode = "stereo (DUAL_CHANNEL_AGENT)" if stereo else "mono"
+        logger.info("RecordingManager initialized — mode=%s (credentials fetched per-session)", mode)
 
     async def _fetch_credentials(self, room_name: str) -> dict:
         """Fetch short-lived S3 credentials from the credentials endpoint.
@@ -134,10 +146,9 @@ class RecordingManager:
                 hls_res = await self.lkapi.egress.start_room_composite_egress(hls_req)
                 logger.info("HLS recording started with egress ID: %s", hls_res.egress_id)
 
-            # Start single file recording (primary)
-            single_file_req = api.RoomCompositeEgressRequest(  # type: ignore[attr-defined]  # noqa: PGH003
+            # Build egress request — stereo uses DUAL_CHANNEL_AGENT mixing
+            egress_kwargs: dict = dict(
                 room_name=room_name,
-                layout="speaker",
                 audio_only=True,
                 file_outputs=[
                     api.EncodedFileOutput(  # type: ignore[attr-defined]  # noqa: PGH003
@@ -148,14 +159,26 @@ class RecordingManager:
                 ],
             )
 
-            logger.info("Starting single file recording for room %s", room_name)
+            if self.stereo:
+                egress_kwargs["audio_mixing"] = egress_proto.AudioMixing.Value(
+                    "DUAL_CHANNEL_AGENT"
+                )
+            else:
+                egress_kwargs["layout"] = "speaker"
+
+            single_file_req = api.RoomCompositeEgressRequest(**egress_kwargs)  # type: ignore[attr-defined]  # noqa: PGH003
+
+            mode_label = "stereo" if self.stereo else "mono"
+            logger.info("Starting %s recording for room %s", mode_label, room_name)
             single_file_res = await self.lkapi.egress.start_room_composite_egress(
                 single_file_req
             )
 
             egress_id = single_file_res.egress_id
+            self.egress_id = egress_id
             logger.info(
-                "Single file recording started with egress ID: %s",
+                "%s recording started with egress ID: %s",
+                mode_label.capitalize(),
                 egress_id,
             )
 
@@ -232,9 +255,29 @@ class RecordingManager:
             logger.error("Failed to check egress status: %s", e, exc_info=True)
             raise
 
+    async def stop_egress(self) -> None:
+        """Stop the active egress gracefully so the file is finalised on S3.
+
+        Must be called **before** the room is deleted, otherwise the egress
+        will be terminated abruptly and the recording may be incomplete.
+        """
+        if not self.egress_id:
+            return
+
+        try:
+            await self.lkapi.egress.stop_egress(
+                api.StopEgressRequest(egress_id=self.egress_id)  # type: ignore[attr-defined]  # noqa: PGH003
+            )
+            logger.info("Egress stopped — egress_id=%s (file finalised on S3)", self.egress_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not stop egress %s: %s", self.egress_id, e)
+        finally:
+            self.egress_id = None
+
     async def stop_recording(self) -> None:
-        """Stop recording and clean up resources"""
+        """Stop the active egress and clean up resources."""
         self.recording_active.clear()
+        await self.stop_egress()
         try:
             await self.lkapi.aclose()
             logger.info("LiveKit API client closed")
