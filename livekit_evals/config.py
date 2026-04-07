@@ -48,7 +48,7 @@ LIVEKIT_CONFIG = {
 # =============================================================================
 # Webhook Configuration
 # =============================================================================
-_DEFAULT_WEBHOOK_URL = "https://orchestration-service-v2.onrender.com/webhooks/livekit"
+_DEFAULT_WEBHOOK_URL = "https://orchestration-service-v2.onrender.com/webhooks/obs/livekit"
 _DEFAULT_WEBHOOK_API_KEY = ""
 
 WEBHOOK_CONFIG = {
