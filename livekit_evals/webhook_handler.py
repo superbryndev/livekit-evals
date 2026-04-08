@@ -90,6 +90,7 @@ class WebhookHandler:
         recording_manager: Optional["RecordingManager"] = None,
         disable_recording: bool = False,
         stereo_recording: bool = False,
+        defer_recording: bool = False,
     ):
         """
         Initialize webhook handler.
@@ -105,6 +106,9 @@ class WebhookHandler:
             disable_recording: Set to True to disable call recording (default: False, recording enabled)
             stereo_recording: If True, record in dual-channel stereo (L=agent, R=others).
                 Implies recording is enabled (overrides disable_recording).
+            defer_recording: If True, recording does NOT start automatically in
+                ``attach_to_session``.  The caller must invoke ``start_recording()``
+                explicitly (e.g. when the remote participant connects).
         """
         self.webhook_url = webhook_url
         self.api_key = api_key
@@ -115,6 +119,7 @@ class WebhookHandler:
         self.recording_manager = recording_manager
         self.disable_recording = disable_recording
         self.stereo_recording = stereo_recording
+        self.defer_recording = defer_recording
         
         # These will be auto-detected
         self.agent_id: Optional[str] = None
@@ -199,6 +204,39 @@ class WebhookHandler:
             self.egress_enabled = True
             logger.info("Recording URL set: %s (egress_id: %s)", recording_url, egress_id)
     
+    async def start_recording(self) -> None:
+        """Start recording the call.
+
+        When ``defer_recording=True`` was passed to the factory, this must be
+        called explicitly (e.g. when the remote participant connects).
+        When ``defer_recording=False`` (default), recording starts
+        automatically inside ``attach_to_session`` and calling this is a no-op.
+        """
+        if self.recording_url:
+            return
+
+        if self.disable_recording and not self.stereo_recording:
+            return
+
+        if not self.recording_manager:
+            return
+
+        mode = "stereo" if self.stereo_recording else "mono"
+        logger.info("Starting %s recording for room %s", mode, self.room.name)
+        recording_url, egress_id = await self.recording_manager.start_recording(
+            room_name=self.room.name,
+            phone_number=self.phone_number,
+        )
+        if recording_url:
+            self.set_recording_url(
+                recording_url=recording_url,
+                egress_id=egress_id,
+                stereo_recording_url=recording_url if self.stereo_recording else None,
+            )
+            logger.info("Recording started successfully (%s): %s", mode, recording_url)
+        else:
+            logger.warning("Failed to start recording")
+
     async def stop_egress(self) -> None:
         """Stop the active egress so the recording file is finalised on S3.
 
@@ -481,28 +519,12 @@ class WebhookHandler:
             self.agent_id = "livekit-agent-default"
             logger.warning("agent_id not configured - using fallback: %s", self.agent_id)
         
-        # Start recording unless disabled
-        if self.disable_recording and not self.stereo_recording:
-            logger.info("Recording disabled by disable_recording flag")
-        elif self.recording_manager:
+        # Start recording unless deferred or disabled
+        if self.defer_recording:
+            logger.info("Recording deferred — call start_recording() explicitly")
+        else:
             try:
-                mode = "stereo" if self.stereo_recording else "mono"
-                logger.info("Starting %s recording for room %s", mode, self.room.name)
-                recording_url, egress_id = await self.recording_manager.start_recording(
-                    room_name=self.room.name,
-                    phone_number=self.phone_number,
-                )
-                
-                if recording_url:
-                    self.set_recording_url(
-                        recording_url=recording_url,
-                        egress_id=egress_id,
-                        stereo_recording_url=recording_url if self.stereo_recording else None,
-                    )
-                    logger.info("Recording started successfully (%s): %s", mode, recording_url)
-                else:
-                    logger.warning("Failed to start recording")
-                    
+                await self.start_recording()
             except Exception as e:  # noqa: BLE001
                 logger.error("Failed to start recording: %s", e, exc_info=True)
         
@@ -1082,6 +1104,7 @@ def create_webhook_handler(
     call_rate_usd: Optional[float] = None,
     disable_recording: bool = False,
     stereo_recording: bool = False,
+    defer_recording: bool = False,
 ) -> Optional[WebhookHandler]:
     """
     Factory function to create a webhook handler from environment variables.
@@ -1097,6 +1120,10 @@ def create_webhook_handler(
     on the right channel. This also auto-populates ``stereo_recording_url`` in
     the webhook payload.
     
+    When ``defer_recording=True``, recording does NOT start automatically in
+    ``attach_to_session``.  Call ``webhook_handler.start_recording()`` when ready
+    (e.g. when a remote participant connects).
+    
     Requires SUPERBRYN_API_KEY in environment or as parameter for webhook authentication.
     
     Args:
@@ -1108,6 +1135,8 @@ def create_webhook_handler(
         disable_recording: Set to True to disable call recording (default: False, recording enabled)
         stereo_recording: If True, record in dual-channel stereo (L=agent, R=others).
             Implies recording is enabled (overrides disable_recording).
+        defer_recording: If True, recording will not start in attach_to_session.
+            Call start_recording() explicitly when the remote participant connects.
     
     Returns:
         WebhookHandler instance or None if webhook is disabled
@@ -1162,6 +1191,7 @@ def create_webhook_handler(
         recording_manager=recording_manager,
         disable_recording=disable_recording,
         stereo_recording=stereo_recording,
+        defer_recording=defer_recording,
     )
     
     mode = "stereo" if stereo_recording else ("disabled" if not should_record else ("enabled" if recording_manager else "unavailable"))

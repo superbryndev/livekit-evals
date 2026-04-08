@@ -18,6 +18,7 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 - 📞 **SIP Support** - Detects SIP trunking and phone numbers
 - 🎥 **Recording URLs** - Captures egress recording links
 - 🎙️ **Call Recordings** - Automatic call recording to S3 (MP3 format, enabled by default, no S3 config needed)
+- 🔊 **Stereo Recording** - Dual-channel recording with agent on left, caller on right (one param)
 - 🔐 **Secure** - API key authentication; temporary S3 credentials fetched per-session
 
 ## 🚀 Quick Start
@@ -264,6 +265,7 @@ VERSION_ID=v1.0.0
       ]
     },
     "recording_url": "https://...",
+    "stereo_recording_url": "https://...",
     "metadata": {
       "agent_id": "my-agent",
       "livekit_project_id": "my-project",
@@ -384,6 +386,35 @@ webhook_handler = create_webhook_handler(
     is_deployed_on_lk_cloud=True,
     disable_recording=True  # Disable call recording
 )
+```
+
+### Stereo Recording (Dual-Channel)
+
+Record in dual-channel stereo where the **agent is on the left channel** and **all other participants (caller/SIP) are on the right channel**. This is useful for separate-speaker transcription and analysis.
+
+```python
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    stereo_recording=True  # L=agent, R=caller
+)
+```
+
+When stereo is enabled, both `recording_url` and `stereo_recording_url` are automatically populated in the webhook payload:
+
+```json
+{
+  "call": {
+    "recording_url": "https://...call.mp3",
+    "stereo_recording_url": "https://...call.mp3"
+  }
+}
+```
+
+If you need to stop the recording before deleting the room (e.g. in a graceful shutdown), call `stop_egress()` to ensure the file is finalized on S3:
+
+```python
+await webhook_handler.stop_egress()  # finalize recording before room deletion
 ```
 
 ### Passing Metadata via Job Context
