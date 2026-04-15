@@ -139,6 +139,7 @@ class WebhookHandler:
         self.ended_at: Optional[datetime] = None
         self.ring_started_at: Optional[datetime] = None
         self.call_end_reason: Optional[str] = None
+        self._preferred_call_end_reason: Optional[str] = None
         
         # Transcript tracking
         self.transcript_turns: list[dict[str, Any]] = []
@@ -203,6 +204,12 @@ class WebhookHandler:
         if recording_url:
             self.egress_enabled = True
             logger.info("Recording URL set: %s (egress_id: %s)", recording_url, egress_id)
+
+    def set_call_end_reason(self, reason: Optional[str]) -> None:
+        """Override the reason sent in the final webhook payload."""
+        if reason and reason.strip():
+            self._preferred_call_end_reason = reason.strip()
+            self.call_end_reason = reason.strip()
     
     async def start_recording(self) -> None:
         """Start recording the call.
@@ -791,7 +798,9 @@ class WebhookHandler:
                 logger.error("Session closed with error: %s", event.error)
             
             # Capture end reason
-            if hasattr(event, 'reason') and event.reason is not None:
+            if self._preferred_call_end_reason:
+                self.call_end_reason = self._preferred_call_end_reason
+            elif hasattr(event, 'reason') and event.reason is not None:
                 self.call_end_reason = event.reason.value if hasattr(event.reason, 'value') else str(event.reason)
             elif event.error:
                 self.call_end_reason = "error"
