@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Public `WebhookHandler.set_call_end_reason(reason)` method to let agents persist semantic/business end reasons such as `transfer_to_human`, `conversation_complete`, or `no_answer_timeout` in the final webhook payload
+- README documentation for semantic call end reasons and graceful shutdown usage
+
 ### Fixed
 - Fixed `ModuleNotFoundError: No module named 'config'` by changing absolute import to relative import in `webhook_handler.py`
 
@@ -73,4 +77,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.1.3...HEAD
 [0.1.3]: https://github.com/superbryndev/livekit-evals/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/superbryndev/livekit-evals/releases/tag/v0.1.0
-

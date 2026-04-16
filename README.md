@@ -417,6 +417,44 @@ If you need to stop the recording before deleting the room (e.g. in a graceful s
 await webhook_handler.stop_egress()  # finalize recording before room deletion
 ```
 
+### Semantic Call End Reasons
+
+If your agent knows the **business reason** for ending a call, set it explicitly on
+the `WebhookHandler` before closing the room. This helps preserve reasons such as
+`transfer_to_human`, `conversation_complete`, `caller_hung_up`, or
+`no_answer_timeout` in the final webhook payload.
+
+Without this, LiveKit may only emit a generic close reason like "participant left"
+or "session closed".
+
+```python
+# Example: transfer to human
+webhook_handler.set_call_end_reason("transfer_to_human")
+await webhook_handler.stop_egress()
+await ctx.api.room.delete_room(...)
+```
+
+You can use any short snake_case reason string that fits your application.
+
+Common examples:
+
+- `conversation_complete`
+- `purpose_achieved`
+- `transfer_to_human`
+- `caller_hung_up`
+- `main_agent_hung_up`
+- `no_answer_timeout`
+- `silence_timeout`
+- `duration_limit`
+
+`set_call_end_reason()` is most useful when **your application logic** decides why
+the call is ending. For example:
+
+- an `end_call` tool is invoked by the agent
+- your app triggers a transfer to a human
+- you enforce a silence timeout or no-answer timeout
+- you intentionally delete the room during graceful shutdown
+
 ### Passing Metadata via Job Context
 
 You can pass custom metadata when creating LiveKit jobs:
@@ -553,4 +591,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 Made with ❤️ by [SuperBryn](https://www.superbryn.com)
-
