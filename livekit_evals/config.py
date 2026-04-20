@@ -9,17 +9,19 @@ the SUPERBRYN_API_KEY -- no S3 keys are stored in this package.
 import os
 
 # =============================================================================
+# Base URL
+# =============================================================================
+_DEFAULT_BASE_URL = "https://api.superbryn.com"
+BASE_URL = os.getenv("SUPERBRYN_BASE_URL", _DEFAULT_BASE_URL)
+
+# =============================================================================
 # Recording Credentials Configuration
 # =============================================================================
 # Temporary S3 credentials are fetched per-session from this endpoint.
 # The SUPERBRYN_API_KEY is used to authenticate the request.
 
-_DEFAULT_CREDENTIALS_URL = (
-    "https://orchestration-service-v2.onrender.com/api/recording-credentials"
-)
-
 CREDENTIALS_CONFIG = {
-    "url": os.getenv("SUPERBRYN_CREDENTIALS_URL", _DEFAULT_CREDENTIALS_URL),
+    "url": os.getenv("SUPERBRYN_CREDENTIALS_URL", f"{BASE_URL}/api/recording-credentials"),
 }
 
 # =============================================================================
@@ -48,10 +50,9 @@ LIVEKIT_CONFIG = {
 # =============================================================================
 # Webhook Configuration
 # =============================================================================
-_DEFAULT_WEBHOOK_URL = "https://orchestration-service-v2.onrender.com/webhooks/obs/livekit"
 _DEFAULT_WEBHOOK_API_KEY = ""
 
 WEBHOOK_CONFIG = {
-    "url": os.getenv("WEBHOOK_URL", _DEFAULT_WEBHOOK_URL),
+    "url": os.getenv("WEBHOOK_URL", f"{BASE_URL}/webhooks/obs/livekit"),
     "api_key": os.getenv("SUPERBRYN_API_KEY", _DEFAULT_WEBHOOK_API_KEY),
 }
