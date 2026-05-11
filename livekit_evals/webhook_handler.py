@@ -43,6 +43,113 @@ from .recording_manager import RecordingManager
 logger = logging.getLogger("webhook_handler")
 
 
+def _mask_api_key(api_key: Optional[str]) -> str:
+    """Return a redacted representation of an API key safe for logging."""
+    if not api_key:
+        return "<not-set>"
+    key_len = len(api_key)
+    if key_len <= 8:
+        return "*" * key_len
+    return f"{api_key[:4]}...{api_key[-4:]} (len={key_len})"
+
+
+# Attribute names commonly used by TTS/STT/LLM wrappers to reference the
+# underlying instance.  Listed in priority order — the first attribute present
+# on the wrapper wins.  ``_tts_instances`` / ``_stt_instances`` /
+# ``_llm_instances`` are lists used by LiveKit's ``FallbackAdapter`` (we take
+# the first entry as the "primary" base provider for reporting purposes).
+_TTS_INNER_ATTRS: tuple[str, ...] = (
+    "_tts_instances",   # livekit.agents.tts.FallbackAdapter
+    "_wrapped_tts",     # livekit.agents.tts.StreamAdapter
+    "_inner_tts",       # MixedAudioTTS, etc.
+    "_inner",           # NetworkGlitchTTS, SanitizedTTS, VolumeTTS, etc.
+    "_base_tts",
+    "tts",
+)
+_STT_INNER_ATTRS: tuple[str, ...] = (
+    "_stt_instances",   # livekit.agents.stt.FallbackAdapter
+    "_wrapped_stt",     # livekit.agents.stt.StreamAdapter
+    "_inner_stt",
+    "_inner",
+    "_base_stt",
+    "stt",
+)
+_LLM_INNER_ATTRS: tuple[str, ...] = (
+    "_llm_instances",   # livekit.agents.llm.FallbackAdapter
+    "_inner_llm",
+    "_inner",
+    "_base_llm",
+    "llm",
+)
+
+
+def _unwrap_to_base_component(component: Any, inner_attrs: tuple[str, ...]) -> Any:
+    """Recursively descend through TTS/STT/LLM wrappers to find the base provider.
+
+    Some agents wrap their TTS/STT/LLM with adapters (FallbackAdapter, StreamAdapter)
+    or custom behavioural wrappers (network-glitch, mixed-audio, volume, sanitiser,
+    etc.).  The module path of the wrapper is not the actual provider, so we walk
+    down ``inner_attrs`` until we either:
+
+      * reach a component whose module path is ``livekit.plugins.<provider>.*``
+        (a real provider plugin), or
+      * run out of wrapper attributes to follow.
+
+    For list-valued attributes (``_tts_instances`` on ``FallbackAdapter``), the
+    first instance is used as the representative base provider.
+    """
+    if component is None:
+        return None
+
+    visited: set[int] = set()
+    current = component
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+
+        module_path = getattr(current, "__module__", "") or ""
+        if module_path.startswith("livekit.plugins."):
+            return current
+
+        next_inner: Any = None
+        for attr in inner_attrs:
+            if not hasattr(current, attr):
+                continue
+            candidate = getattr(current, attr)
+            if candidate is None:
+                continue
+            if isinstance(candidate, (list, tuple)):
+                if not candidate:
+                    continue
+                candidate = candidate[0]
+            if candidate is current:
+                continue
+            next_inner = candidate
+            break
+
+        if next_inner is None:
+            return current
+        current = next_inner
+
+    return current
+
+
+def _extract_provider_from_module(component: Any) -> Optional[str]:
+    """Extract the provider name from a component's module path.
+
+    For ``livekit.plugins.<provider>.<module>`` we return ``<provider>``;
+    otherwise we fall back to the last segment of the module path.
+    """
+    if component is None:
+        return None
+    module_path = getattr(component, "__module__", "") or ""
+    if not module_path:
+        return None
+    parts = module_path.split(".")
+    if len(parts) >= 3 and parts[0] == "livekit" and parts[1] == "plugins":
+        return parts[2]
+    return parts[-1] if parts else None
+
+
 def _extract_project_id_from_url(livekit_url: str) -> Optional[str]:
     """
     Extract project ID from LiveKit URL.
@@ -182,6 +289,27 @@ class WebhookHandler:
             is_deployed_on_lk_cloud,
             livekit_project_id or "not-set",
         )
+
+        logger.info(
+            "SUPERBRYN_CONFIG_LOADED: webhook_url=%s | api_key=%s | "
+            "credentials_url=%s | base_url=%s | livekit_project_id=%s | "
+            "is_deployed_on_lk_cloud=%s | call_rate_usd=%s | "
+            "disable_recording=%s | stereo_recording=%s | defer_recording=%s | "
+            "recording_manager=%s | agent_id_default=%s | version_id_default=%s",
+            self.webhook_url,
+            _mask_api_key(self.api_key),
+            CREDENTIALS_CONFIG.get("url"),
+            os.getenv("SUPERBRYN_BASE_URL", "https://api.superbryn.com"),
+            self.livekit_project_id or "not-set",
+            self.is_deployed_on_lk_cloud,
+            self.call_rate_usd,
+            self.disable_recording,
+            self.stereo_recording,
+            self.defer_recording,
+            "enabled" if self.recording_manager else "disabled",
+            AGENT_CONFIG.get("id"),
+            AGENT_CONFIG.get("version_id"),
+        )
     
     def set_recording_url(
         self,
@@ -254,85 +382,86 @@ class WebhookHandler:
             await self.recording_manager.stop_egress()
     
     def _extract_session_config(self, session: AgentSession) -> None:
-        """Extract model/provider info from session configuration using Whispey's approach."""
+        """Extract model/provider info from session configuration using Whispey's approach.
+
+        Components (TTS in particular) may be wrapped by adapters
+        (``FallbackAdapter``, ``StreamAdapter``) or custom behavioural wrappers
+        (network-glitch, mixed-audio, volume, sanitiser, etc.).  In those cases
+        the wrapper's module path is not the real provider name, so we descend
+        through known inner-instance attributes to find the underlying plugin
+        (e.g. ``cartesia``, ``sarvam``) before reading model/provider info.
+        """
         try:
-            # Extract LLM info
             if hasattr(session, 'llm') and session.llm:
-                llm_obj = session.llm
-                
-                # Get model from direct attribute
+                wrapper_llm = session.llm
+                llm_obj = _unwrap_to_base_component(wrapper_llm, _LLM_INNER_ATTRS) or wrapper_llm
+                if llm_obj is not wrapper_llm:
+                    logger.info(
+                        "Unwrapped LLM: %s -> %s",
+                        getattr(wrapper_llm, "__module__", type(wrapper_llm).__name__),
+                        getattr(llm_obj, "__module__", type(llm_obj).__name__),
+                    )
+
                 if hasattr(llm_obj, 'model'):
                     self.usage_metrics["llm_model"] = llm_obj.model
-                
-                # Extract provider from module name
-                # Check if it's a plugin (livekit.plugins.X.llm) and extract X
-                module_path = llm_obj.__module__
-                if 'livekit.plugins.' in module_path:
-                    # Extract plugin name from livekit.plugins.PROVIDER.llm
-                    provider_name = module_path.split('.')[2] if len(module_path.split('.')) > 2 else module_path.split('.')[-1]
-                else:
-                    provider_name = module_path.split('.')[-1]
-                self.usage_metrics["llm_provider"] = provider_name
-                
-                # Also try to extract from _opts if available
+
+                provider_name = _extract_provider_from_module(llm_obj)
+                if provider_name:
+                    self.usage_metrics["llm_provider"] = provider_name
+
                 if hasattr(llm_obj, '_opts') and llm_obj._opts:
                     opts = llm_obj._opts
                     if hasattr(opts, 'model') and not self.usage_metrics["llm_model"]:
                         self.usage_metrics["llm_model"] = opts.model
-            
-            # Extract STT info
+
             if hasattr(session, 'stt') and session.stt:
-                stt_obj = session.stt
-                
-                # Get model from direct attribute
+                wrapper_stt = session.stt
+                stt_obj = _unwrap_to_base_component(wrapper_stt, _STT_INNER_ATTRS) or wrapper_stt
+                if stt_obj is not wrapper_stt:
+                    logger.info(
+                        "Unwrapped STT: %s -> %s",
+                        getattr(wrapper_stt, "__module__", type(wrapper_stt).__name__),
+                        getattr(stt_obj, "__module__", type(stt_obj).__name__),
+                    )
+
                 if hasattr(stt_obj, 'model'):
                     self.usage_metrics["stt_model"] = stt_obj.model
-                
-                # Extract provider from module name
-                # Check if it's a plugin (livekit.plugins.X.stt) and extract X
-                module_path = stt_obj.__module__
-                if 'livekit.plugins.' in module_path:
-                    # Extract plugin name from livekit.plugins.PROVIDER.stt
-                    provider_name = module_path.split('.')[2] if len(module_path.split('.')) > 2 else module_path.split('.')[-1]
-                else:
-                    provider_name = module_path.split('.')[-1]
-                self.usage_metrics["stt_provider"] = provider_name
-                
-                # Also try to extract from _opts if available
+
+                provider_name = _extract_provider_from_module(stt_obj)
+                if provider_name:
+                    self.usage_metrics["stt_provider"] = provider_name
+
                 if hasattr(stt_obj, '_opts') and stt_obj._opts:
                     opts = stt_obj._opts
                     if hasattr(opts, 'model') and not self.usage_metrics["stt_model"]:
                         self.usage_metrics["stt_model"] = opts.model
-                    
+
                     # Speechmatics uses operating_point instead of model
                     if hasattr(opts, 'operating_point') and not self.usage_metrics["stt_model"]:
                         self.usage_metrics["stt_model"] = opts.operating_point
-            
-            # Extract TTS info
+
             if hasattr(session, 'tts') and session.tts:
-                tts_obj = session.tts
-                
-                # Get voice_id from direct attribute
+                wrapper_tts = session.tts
+                tts_obj = _unwrap_to_base_component(wrapper_tts, _TTS_INNER_ATTRS) or wrapper_tts
+                if tts_obj is not wrapper_tts:
+                    logger.info(
+                        "Unwrapped TTS: %s -> %s",
+                        getattr(wrapper_tts, "__module__", type(wrapper_tts).__name__),
+                        getattr(tts_obj, "__module__", type(tts_obj).__name__),
+                    )
+
                 if hasattr(tts_obj, 'voice_id'):
                     self.usage_metrics["tts_voice_id"] = tts_obj.voice_id
                 elif hasattr(tts_obj, 'voice'):
                     self.usage_metrics["tts_voice_id"] = tts_obj.voice
-                
-                # Get model from direct attribute
+
                 if hasattr(tts_obj, 'model'):
                     self.usage_metrics["tts_model"] = tts_obj.model
-                
-                # Extract provider from module name
-                # Check if it's a plugin (livekit.plugins.X.tts) and extract X
-                module_path = tts_obj.__module__
-                if 'livekit.plugins.' in module_path:
-                    # Extract plugin name from livekit.plugins.PROVIDER.tts
-                    provider_name = module_path.split('.')[2] if len(module_path.split('.')) > 2 else module_path.split('.')[-1]
-                else:
-                    provider_name = module_path.split('.')[-1]
-                self.usage_metrics["tts_provider"] = provider_name
-                
-                # Also try to extract from _opts if available
+
+                provider_name = _extract_provider_from_module(tts_obj)
+                if provider_name:
+                    self.usage_metrics["tts_provider"] = provider_name
+
                 if hasattr(tts_obj, '_opts') and tts_obj._opts:
                     opts = tts_obj._opts
                     if hasattr(opts, 'voice_id') and not self.usage_metrics.get("tts_voice_id"):
@@ -341,9 +470,9 @@ class WebhookHandler:
                         self.usage_metrics["tts_voice_id"] = opts.voice
                     if hasattr(opts, 'model') and not self.usage_metrics["tts_model"]:
                         self.usage_metrics["tts_model"] = opts.model
-                
-                # Fallback: if no voice_id found but model exists, use model as voice_id
-                # This is common for providers like Sarvam where model name IS the voice
+
+                # Fallback: if no voice_id found but model exists, use model as voice_id.
+                # This is common for providers like Sarvam where model name IS the voice.
                 if not self.usage_metrics["tts_voice_id"] and self.usage_metrics["tts_model"]:
                     self.usage_metrics["tts_voice_id"] = self.usage_metrics["tts_model"]
             

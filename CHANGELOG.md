@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-05-11
+
 ### Added
+- `SUPERBRYN_CONFIG_LOADED` log line emitted right after `WebhookHandler` initialization. It reports the resolved `webhook_url`, masked `api_key`, `credentials_url`, `base_url`, `livekit_project_id`, `is_deployed_on_lk_cloud`, `call_rate_usd`, recording flags (`disable_recording`, `stereo_recording`, `defer_recording`), recording manager status, and default `agent_id` / `version_id`, so the target environment is auditable from logs.
+- Base-provider resolution for TTS/STT/LLM. `_extract_session_config` now descends through wrapper chains (LiveKit `FallbackAdapter` / `StreamAdapter` and custom wrappers like `NetworkGlitchTTS`, `MixedAudioTTS`, `SanitizedTTS`, `VolumeTTS`) via known inner-instance attributes (`_tts_instances`, `_wrapped_tts`, `_inner_tts`, `_inner`, `_base_tts`, `tts`, plus STT/LLM equivalents). It stops at the first `livekit.plugins.<provider>.*` module, so `tts_provider`/`stt_provider`/`llm_provider` now report the real base provider (e.g. `cartesia`, `sarvam`) instead of wrapper names (`fallback_adapter`, `mixed_tts`, `network_glitch`, `glitch`, `config`). Cycle-safe via an `id()`-keyed visited set.
+
+### Added (from prior unreleased work)
 - Public `WebhookHandler.set_call_end_reason(reason)` method to let agents persist semantic/business end reasons such as `transfer_to_human`, `conversation_complete`, or `no_answer_timeout` in the final webhook payload
 - README documentation for semantic call end reasons and graceful shutdown usage
 
