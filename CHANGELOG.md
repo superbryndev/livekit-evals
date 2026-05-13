@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-05-13
+
+### Fixed
+- Restored `tts_characters`, `tts_audio_duration_seconds`, and TTS latency tracking for sessions whose TTS is wrapped by custom classes that don't forward `metrics_collected` (e.g. `SanitizedTTS`, `VolumeTTS`, `MixedAudioTTS`, `NetworkGlitchTTS`). The framework only re-emits the event off `session.tts`, i.e. the outer wrapper, so any wrapper that forgot to relay it caused these counters to remain at zero (most visibly for Sarvam, which is always wrapped to sanitise input). `WebhookHandler.attach_to_session` now also subscribes to the underlying base TTS/STT/LLM (resolved via the existing `_unwrap_to_base_component` walker introduced in 0.2.6) and routes events through the same handler. `_on_metrics_collected` deduplicates by `(type, request_id, segment_id)` for `LLMMetrics` / `STTMetrics` / `TTSMetrics` / `RealtimeModelMetrics`, so adapters that do forward (`FallbackAdapter`, `StreamAdapter`) don't double-count. Subscriptions are released on session close.
+
+## [0.2.7] - 2026-05-11
+
+### Notes
+- Version published from the same commit as 0.2.6 due to the auto-publish workflow's patch bump. Contents are identical to 0.2.6 (base-provider unwrap + `SUPERBRYN_CONFIG_LOADED` log line). Documented here to keep the changelog aligned with PyPI.
+
 ## [0.2.6] - 2026-05-11
 
 ### Added

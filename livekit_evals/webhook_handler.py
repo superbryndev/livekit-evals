@@ -283,6 +283,17 @@ class WebhookHandler:
         
         # Speech events tracking
         self.speech_events: list[dict[str, Any]] = []
+
+        # Defensive base-component metrics subscriptions.
+        # Custom user wrappers (e.g. ``SanitizedTTS``, ``VolumeTTS``,
+        # ``MixedAudioTTS``, ``NetworkGlitchTTS``) frequently forget to forward
+        # the inner plugin's ``metrics_collected`` event, which causes
+        # ``tts_characters`` / ``tts_audio_duration_seconds`` / TTS latency to
+        # silently report zero.  ``attach_to_session`` subscribes directly to
+        # the base TTS/STT/LLM components as a safety net, and these structures
+        # let us dedup re-emitted events and unsubscribe on session close.
+        self._base_metric_subscriptions: list[tuple[Any, Any]] = []
+        self._seen_metrics: set[tuple[Optional[str], Optional[str], Optional[str]]] = set()
         
         logger.info(
             "WebhookHandler initialized: is_deployed_on_lk_cloud=%s, livekit_project_id=%s (agent_id and version_id will be auto-detected)",
@@ -683,6 +694,17 @@ class WebhookHandler:
         
         # Listen to metrics for usage and latency
         session.on("metrics_collected")(self._on_metrics_collected)
+
+        # Defensive: also subscribe to the underlying base TTS/STT/LLM directly.
+        # ``session.on("metrics_collected")`` only fires for events that the
+        # outer wrapper re-emits, and several common custom wrappers
+        # (``SanitizedTTS``, ``VolumeTTS``, ``MixedAudioTTS``,
+        # ``NetworkGlitchTTS``) do not forward them.  Subscribing on the base
+        # provider lets us still observe the inner ``TTSMetrics`` /
+        # ``STTMetrics`` / ``LLMMetrics`` even in that case.  Dedup via
+        # ``self._seen_metrics`` prevents double-counting when the wrapper does
+        # forward (e.g. ``FallbackAdapter`` / ``StreamAdapter``).
+        self._subscribe_to_base_components(session)
         
         # Listen to user input for additional transcript metadata
         session.on("user_input_transcribed")(self._on_user_input_transcribed)
@@ -936,14 +958,39 @@ class WebhookHandler:
             
             # Mark session as ended
             self.ended_at = datetime.now(timezone.utc)
-            
+
+            # Unsubscribe from base TTS/STT/LLM components so the handler isn't
+            # invoked after we've sent the webhook (and to release references).
+            for component, callback in self._base_metric_subscriptions:
+                try:
+                    if hasattr(component, "off"):
+                        component.off("metrics_collected", callback)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Failed to unsubscribe base metrics listener: %s", e)
+            self._base_metric_subscriptions.clear()
+
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to handle session close: %s", e)
     
     def _on_metrics_collected(self, event: MetricsCollectedEvent) -> None:
         """Handle metrics collected event."""
         metrics_obj = event.metrics
-        
+
+        # Dedup metrics that may be observed both via ``session`` (wrapper-
+        # forwarded) and via our defensive base-component subscription.  Only
+        # provider-emitted types participate; framework-emitted VAD/EOU events
+        # never flow through the base subscription and don't have a stable
+        # request_id, so we skip dedup for them.
+        if isinstance(metrics_obj, (LLMMetrics, STTMetrics, TTSMetrics, RealtimeModelMetrics)):
+            key = (
+                getattr(metrics_obj, "type", None),
+                getattr(metrics_obj, "request_id", None),
+                getattr(metrics_obj, "segment_id", None),
+            )
+            if key in self._seen_metrics:
+                return
+            self._seen_metrics.add(key)
+
         # Use Whispey's approach: collect metrics and log them
         self.usage_collector.collect(metrics_obj)
         metrics.log_metrics(metrics_obj)
@@ -994,7 +1041,62 @@ class WebhookHandler:
         # VADMetrics and EOUMetrics don't contribute to usage/latency tracking
         # but we log them for debugging
         # logger.debug("Metrics collected: %s", metrics_obj.type)
-    
+
+    def _subscribe_to_base_components(self, session: AgentSession) -> None:
+        """Subscribe to the base TTS/STT/LLM components' ``metrics_collected``
+        events as a defensive backstop for wrappers that don't forward.
+
+        See the docstring on ``_on_base_metrics_collected`` for the dedup
+        strategy that prevents double-counting when the wrapper does forward.
+        """
+        for outer, inner_attrs, label in (
+            (getattr(session, "tts", None), _TTS_INNER_ATTRS, "tts"),
+            (getattr(session, "stt", None), _STT_INNER_ATTRS, "stt"),
+            (getattr(session, "llm", None), _LLM_INNER_ATTRS, "llm"),
+        ):
+            if outer is None:
+                continue
+            try:
+                base = _unwrap_to_base_component(outer, inner_attrs)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to unwrap %s base component: %s", label, e)
+                continue
+
+            if base is None or base is outer:
+                # No wrapper, or unwrap couldn't find a distinct inner — the
+                # existing ``session.on("metrics_collected")`` subscription is
+                # enough.
+                continue
+            if not hasattr(base, "on"):
+                continue
+
+            try:
+                base.on("metrics_collected", self._on_base_metrics_collected)
+                self._base_metric_subscriptions.append((base, self._on_base_metrics_collected))
+                logger.info(
+                    "Subscribed to base %s metrics directly: %s -> %s",
+                    label,
+                    getattr(outer, "__module__", type(outer).__name__),
+                    getattr(base, "__module__", type(base).__name__),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to subscribe to base %s metrics: %s", label, e)
+
+    def _on_base_metrics_collected(self, metrics_obj: Any) -> None:
+        """Handler for ``metrics_collected`` events emitted directly by the
+        base TTS/STT/LLM provider, bypassing wrappers that don't forward.
+
+        Wraps the raw metrics in a ``MetricsCollectedEvent`` (mirroring the
+        ``AgentSession`` shape) and routes through the same handler used by
+        the session-level subscription.  Dedup happens inside
+        ``_on_metrics_collected``, so whichever path fires first wins and the
+        other becomes a no-op for that ``(type, request_id, segment_id)``.
+        """
+        try:
+            self._on_metrics_collected(MetricsCollectedEvent(metrics=metrics_obj))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to handle base-component metrics event: %s", e)
+
     def _calculate_average_latency(self, latencies: list[float]) -> float:
         """Calculate average latency from a list of measurements."""
         if not latencies:
