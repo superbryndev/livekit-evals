@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-06-03
+
+### Added
+- `custom_data` field in webhook payload (`payload["call"]["custom_data"]`). Accepts any JSON-serializable dict and is forwarded verbatim to the webhook endpoint, letting developers attach arbitrary session-level context (e.g. ticket IDs, user tiers, CRM fields, intent labels) without modifying the package.
+- `custom_data` parameter on `create_webhook_handler()` for setting initial data known at startup.
+- `WebhookHandler.set_custom_data(data)` — replaces `custom_data` entirely at any point before the webhook fires.
+- `WebhookHandler.update_custom_data(data)` — shallow-merges new keys into the existing `custom_data` dict, useful for incrementally enriching context as tool calls resolve during the session.
+
 ## [0.2.8] - 2026-05-13
 
 ### Fixed
@@ -90,6 +98,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secure environment variable handling
 - No sensitive data logged in production
 
-[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/superbryndev/livekit-evals/compare/v0.2.8...v0.2.9
+[0.2.8]: https://github.com/superbryndev/livekit-evals/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/superbryndev/livekit-evals/compare/v0.2.6...v0.2.7
+[0.2.6]: https://github.com/superbryndev/livekit-evals/compare/v0.1.3...v0.2.6
 [0.1.3]: https://github.com/superbryndev/livekit-evals/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/superbryndev/livekit-evals/releases/tag/v0.1.0
