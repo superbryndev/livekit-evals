@@ -19,6 +19,7 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 - 🎥 **Recording URLs** - Captures egress recording links
 - 🎙️ **Call Recordings** - Automatic call recording to S3 (MP3 format, enabled by default, no S3 config needed)
 - 🔊 **Stereo Recording** - Dual-channel recording with agent on left, caller on right (one param)
+- 🗂️ **Custom Data** - Attach arbitrary JSON to every webhook payload via `custom_data`
 - 🔐 **Secure** - API key authentication; temporary S3 credentials fetched per-session
 
 ## 🚀 Quick Start
@@ -302,12 +303,46 @@ VERSION_ID=v1.0.0
       "stt_ms": 120.3,
       "tts_ms": 180.7,
       "total_ms": 751.5
+    },
+    "custom_data": {
+      "ticket_id": "TKT-9001",
+      "customer_tier": "enterprise"
     }
   }
 }
 ```
 
 ## 🛠️ Advanced Usage
+
+### Custom Data
+
+Attach any JSON-serializable fields to the webhook payload using `custom_data`. These are forwarded verbatim in `payload["call"]["custom_data"]` and are never interpreted by the package — they're purely for your own downstream use.
+
+**At creation time** (data known at session startup):
+
+```python
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    custom_data={
+        "ticket_id": "TKT-9001",
+        "customer_tier": "enterprise",
+        "lead_source": "website",
+    },
+)
+```
+
+**During the session** (data discovered at runtime, e.g. after a tool call):
+
+```python
+# Replace the entire dict
+webhook_handler.set_custom_data({"resolved": True, "resolution_code": "answered"})
+
+# Or merge additional keys while keeping existing ones
+webhook_handler.update_custom_data({"appointment_booked": True, "slot": "2026-06-05T10:00"})
+```
+
+Both methods can be called at any point before `send_webhook()` fires on shutdown.
 
 ### Custom API Key
 

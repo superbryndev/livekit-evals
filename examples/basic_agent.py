@@ -75,10 +75,17 @@ async def entrypoint(ctx: JobContext):
     # LIVEKIT-EVALS INTEGRATION - STEP 1: Create webhook handler
     # ============================================================================
     # This will auto-detect agent_id, version_id, system_prompt, phone_number,
-    # SIP trunking, and egress recording from session and room context
+    # SIP trunking, and egress recording from session and room context.
+    #
+    # Pass custom_data to attach any JSON-serializable fields to the webhook
+    # payload (available as payload["call"]["custom_data"]).  You can also
+    # call webhook_handler.update_custom_data({...}) at any point during the
+    # session to add fields discovered at runtime (e.g. after a tool call).
     webhook_handler = create_webhook_handler(
         room=ctx.room,
-        is_deployed_on_lk_cloud=True  # Set to False if self-hosting
+        is_deployed_on_lk_cloud=True,  # Set to False if self-hosting
+        # Optional: attach arbitrary context to every webhook payload
+        # custom_data={"ticket_id": "TKT-9001", "customer_tier": "enterprise"},
     )
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and LiveKit turn detector

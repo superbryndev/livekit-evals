@@ -198,6 +198,7 @@ class WebhookHandler:
         disable_recording: bool = False,
         stereo_recording: bool = False,
         defer_recording: bool = False,
+        custom_data: Optional[dict[str, Any]] = None,
     ):
         """
         Initialize webhook handler.
@@ -216,6 +217,10 @@ class WebhookHandler:
             defer_recording: If True, recording does NOT start automatically in
                 ``attach_to_session``.  The caller must invoke ``start_recording()``
                 explicitly (e.g. when the remote participant connects).
+            custom_data: Arbitrary JSON-serializable dict that is forwarded as-is
+                in the ``call.custom_data`` field of every webhook payload.  Use
+                ``update_custom_data()`` / ``set_custom_data()`` at any point
+                during the session to change it before the webhook fires.
         """
         self.webhook_url = webhook_url
         self.api_key = api_key
@@ -227,6 +232,7 @@ class WebhookHandler:
         self.disable_recording = disable_recording
         self.stereo_recording = stereo_recording
         self.defer_recording = defer_recording
+        self.custom_data: dict[str, Any] = dict(custom_data) if custom_data else {}
         
         # These will be auto-detected
         self.agent_id: Optional[str] = None
@@ -349,7 +355,41 @@ class WebhookHandler:
         if reason and reason.strip():
             self._preferred_call_end_reason = reason.strip()
             self.call_end_reason = reason.strip()
-    
+
+    def set_custom_data(self, data: dict[str, Any]) -> None:
+        """Replace the ``call.custom_data`` field in the webhook payload entirely.
+
+        Call this at any point before the session ends to attach arbitrary
+        JSON-serializable data to the outgoing webhook.  The value is forwarded
+        verbatim in ``payload["call"]["custom_data"]``.
+
+        Example::
+
+            webhook_handler.set_custom_data({
+                "ticket_id": "TKT-9001",
+                "customer_tier": "enterprise",
+                "resolved": True,
+            })
+        """
+        self.custom_data = dict(data)
+
+    def update_custom_data(self, data: dict[str, Any]) -> None:
+        """Shallow-merge *data* into the existing ``call.custom_data`` dict.
+
+        Existing keys not present in *data* are preserved.  Use this to
+        incrementally enrich the payload as events unfold during the call
+        (e.g. after a tool call resolves or an intent is detected).
+
+        Example::
+
+            # Set initial context at session start
+            webhook_handler.update_custom_data({"lead_source": "website"})
+
+            # Later, after a tool call:
+            webhook_handler.update_custom_data({"appointment_booked": True, "slot": "2026-06-05T10:00"})
+        """
+        self.custom_data.update(data)
+
     async def start_recording(self) -> None:
         """Start recording the call.
 
@@ -1150,6 +1190,15 @@ class WebhookHandler:
             self.agent_id = "livekit-agent-default"
             logger.error("agent_id was None when building webhook payload - using fallback: %s", self.agent_id)
         
+        # ``custom_data`` is the only developer-supplied, arbitrary part of the
+        # payload.  Round-trip it through JSON (with ``default=str`` for exotic
+        # values) so a single non-serialisable entry can't make the whole
+        # ``send_webhook`` POST raise and drop the entire payload (transcript,
+        # recording, usage, ...).  Natively-serialisable structures pass through
+        # unchanged; only exotic objects (datetime, set, custom classes) are
+        # coerced to their string form.
+        safe_custom_data = self._sanitize_custom_data()
+        
         # Build payload
         payload = {
             "event": "call.ended",
@@ -1190,10 +1239,29 @@ class WebhookHandler:
                 },
                 "usage": self.usage_metrics,
                 "latency": avg_latency,
+                "custom_data": safe_custom_data,
             },
         }
         
         return payload
+
+    def _sanitize_custom_data(self) -> dict[str, Any]:
+        """Return a JSON-safe copy of ``custom_data``.
+
+        Coerces non-serialisable values to strings via ``default=str`` and, as a
+        last resort (e.g. circular references), drops ``custom_data`` entirely
+        with a warning rather than letting the webhook POST fail.
+        """
+        if not self.custom_data:
+            return {}
+        try:
+            return json.loads(json.dumps(self.custom_data, default=str))
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "custom_data is not JSON-serializable, omitting it from payload: %s",
+                e,
+            )
+            return {}
     
     def _get_participant_identity(self) -> str:
         """Get the first non-agent participant identity."""
@@ -1345,6 +1413,7 @@ def create_webhook_handler(
     disable_recording: bool = False,
     stereo_recording: bool = False,
     defer_recording: bool = False,
+    custom_data: Optional[dict[str, Any]] = None,
 ) -> Optional[WebhookHandler]:
     """
     Factory function to create a webhook handler from environment variables.
@@ -1377,6 +1446,11 @@ def create_webhook_handler(
             Implies recording is enabled (overrides disable_recording).
         defer_recording: If True, recording will not start in attach_to_session.
             Call start_recording() explicitly when the remote participant connects.
+        custom_data: Arbitrary JSON-serializable dict forwarded as-is in
+            ``payload["call"]["custom_data"]``.  Useful for attaching
+            session-level context known at startup (e.g. ticket ID, user tier).
+            Use ``webhook_handler.update_custom_data()`` later to add fields
+            discovered during the call.
     
     Returns:
         WebhookHandler instance or None if webhook is disabled
@@ -1432,6 +1506,7 @@ def create_webhook_handler(
         disable_recording=disable_recording,
         stereo_recording=stereo_recording,
         defer_recording=defer_recording,
+        custom_data=custom_data,
     )
     
     mode = "stereo" if stereo_recording else ("disabled" if not should_record else ("enabled" if recording_manager else "unavailable"))
