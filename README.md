@@ -427,6 +427,8 @@ webhook_handler = create_webhook_handler(
 
 Record in dual-channel stereo where the **agent is on the left channel** and **all other participants (caller/SIP) are on the right channel**. This is useful for separate-speaker transcription and analysis.
 
+Stereo is **opt-in** — the default is mono. Enabling it is a **one-line change**: add `stereo_recording=True`. There is nothing else to configure or install — it reuses the exact same recording pipeline (egress + S3 credentials), just switching the egress to `DUAL_CHANNEL_AGENT` mixing instead of a mono mix.
+
 ```python
 webhook_handler = create_webhook_handler(
     room=ctx.room,
@@ -435,7 +437,14 @@ webhook_handler = create_webhook_handler(
 )
 ```
 
-When stereo is enabled, both `recording_url` and `stereo_recording_url` are automatically populated in the webhook payload:
+**Prerequisites:** the only requirement is that recording already works for you (i.e. you currently get a `recording_url` in your webhook payload). That requires:
+- `SUPERBRYN_API_KEY` set (used to fetch temporary S3 credentials — no S3 config needed)
+- LiveKit Egress available on your deployment (enabled by default on LiveKit Cloud; the egress service must be running if self-hosted)
+- Standard LiveKit env vars (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`)
+
+If recording works today, `stereo_recording=True` is the **only** change needed — no version bump, no new dependency. `stereo_recording=True` also implies recording is enabled (it overrides `disable_recording`).
+
+When stereo is enabled, both `recording_url` and `stereo_recording_url` are populated in the webhook payload. **Note:** a single MP3 file is written — the stereo separation lives in the file's two channels, so both fields point to the *same* URL:
 
 ```json
 {
