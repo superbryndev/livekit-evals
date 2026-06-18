@@ -198,6 +198,12 @@ VERSION_ID=v1.0.0
 - Language detection
 - Speaker IDs
 
+### Tool Calls
+- **Function name** and raw JSON arguments for every tool invoked by the agent
+- **Tool result** (output string) paired with each call
+- **Error flag** (`is_error`) when the tool execution raised an exception
+- **Timing** — `start_ms` (call dispatched) and `end_ms` (result received), both as ms offsets from call start
+
 ### Usage Metrics
 - **LLM:** Input tokens, output tokens, total tokens, model, provider
 - **STT:** Audio duration, model, provider
@@ -265,6 +271,18 @@ VERSION_ID=v1.0.0
         }
       ]
     },
+    "tool_calls": [
+      {
+        "id": "call_abc123",
+        "function_name": "book_appointment",
+        "arguments": "{\"date\": \"2026-06-20\", \"time\": \"10:00\"}",
+        "result": "{\"confirmation_id\": \"APT-9001\", \"status\": \"confirmed\"}",
+        "is_error": false,
+        "start_ms": 12500,
+        "end_ms": 13800,
+        "timestamp_ms": 12500
+      }
+    ],
     "recording_url": "https://...",
     "stereo_recording_url": "https://...",
     "metadata": {
