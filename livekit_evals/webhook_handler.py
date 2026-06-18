@@ -18,6 +18,7 @@ from livekit.agents import (
     AgentStateChangedEvent,
     CloseEvent,
     ConversationItemAddedEvent,
+    FunctionToolsExecutedEvent,
     MetricsCollectedEvent,
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
@@ -258,6 +259,9 @@ class WebhookHandler:
         self.transcript_turns: list[dict[str, Any]] = []
         self.call_start_time_ms: Optional[int] = None
         self.last_user_turn_time_ms: Optional[int] = None
+
+        # Tool call tracking
+        self.tool_calls: list[dict[str, Any]] = []
         
         # Usage metrics tracking
         self.usage_metrics = {
@@ -755,7 +759,10 @@ class WebhookHandler:
         
         # Listen to speech creation for additional tracking
         session.on("speech_created")(self._on_speech_created)
-        
+
+        # Listen to tool/function call execution
+        session.on("function_tools_executed")(self._on_function_tools_executed)
+
         # Listen to session close for cleanup
         session.on("close")(self._on_session_close)
         
@@ -981,6 +988,50 @@ class WebhookHandler:
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to handle speech created event: %s", e)
     
+    def _on_function_tools_executed(self, event: FunctionToolsExecutedEvent) -> None:
+        """Handle function/tool calls and their outputs."""
+        try:
+            current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+            for fc, fco in event.zipped():
+                # Derive start_ms from the FunctionCall's created_at (epoch seconds).
+                # Fall back to now if created_at is zero/missing.
+                fc_created_at = getattr(fc, "created_at", None)
+                if fc_created_at:
+                    fc_abs_ms = int(fc_created_at * 1000)
+                    start_ms = fc_abs_ms - self.call_start_time_ms if self.call_start_time_ms else None
+                else:
+                    start_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else None
+
+                # Derive end_ms from the FunctionCallOutput's created_at when present.
+                end_ms: Optional[int] = None
+                if fco is not None:
+                    fco_created_at = getattr(fco, "created_at", None)
+                    if fco_created_at:
+                        fco_abs_ms = int(fco_created_at * 1000)
+                        end_ms = fco_abs_ms - self.call_start_time_ms if self.call_start_time_ms else None
+
+                entry: dict[str, Any] = {
+                    "id": fc.call_id,
+                    "function_name": fc.name,
+                    "arguments": fc.arguments,  # raw JSON string
+                    "result": fco.output if fco is not None else None,
+                    "is_error": fco.is_error if fco is not None else None,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "timestamp_ms": start_ms,  # backward-compat alias
+                }
+                self.tool_calls.append(entry)
+                logger.info(
+                    "Tool call captured: function=%s call_id=%s start_ms=%s",
+                    fc.name,
+                    fc.call_id,
+                    start_ms,
+                )
+
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to handle function_tools_executed: %s", e)
+
     def _on_session_close(self, event: CloseEvent) -> None:
         """Handle session close event for cleanup."""
         try:
@@ -1214,6 +1265,7 @@ class WebhookHandler:
                 "transcript": {
                     "turns": turns_with_text,
                 },
+                "tool_calls": self.tool_calls,
                 "recording_url": self._get_recording_url(),
                 "stereo_recording_url": self._get_stereo_recording_url(),
                 "metadata": {
