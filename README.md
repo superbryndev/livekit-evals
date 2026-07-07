@@ -150,8 +150,8 @@ if __name__ == "__main__":
 |----------|----------|-------------|---------|
 | `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication and call recording | - |
 | `LIVEKIT_PROJECT_ID` | ⚪ Optional | LiveKit project ID | Auto-detected from `LIVEKIT_URL` |
-| `AGENT_ID` | ⚪ Optional | Unique agent identifier | Auto-detected from job metadata or `"livekit-agent"` |
-| `VERSION_ID` | ⚪ Optional | Agent version identifier | Auto-detected from job metadata or `"v1"` |
+| `AGENT_ID` | ⚪ Optional | Unique agent identifier | `"livekit-agent"` |
+| `VERSION_ID` | ⚪ Optional | Agent version identifier | `"v1"` |
 
 **Note:** Call recording is **enabled by default**. Temporary S3 credentials are fetched automatically using your `SUPERBRYN_API_KEY` -- no S3 configuration needed.
 
@@ -227,9 +227,9 @@ VERSION_ID=v1.0.0
 
 ## 🔍 How It Works
 
-1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `metrics_collected`, `conversation_item_added`)
+1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `conversation_item_added`) and to the per-plugin `metrics_collected` events on STT/LLM/TTS (the non-deprecated metrics surface), with `session_usage_updated` as a fallback for realtime models
 2. **Data Aggregation:** Collects and processes events during the session
-3. **Auto-Detection:** Extracts configuration from session objects and job metadata
+3. **Auto-Detection:** Extracts configuration from session objects
 4. **Webhook Delivery:** Sends comprehensive payload to webhook endpoint when session ends
 
 ### Webhook Payload Format
@@ -441,6 +441,56 @@ webhook_handler = create_webhook_handler(
 )
 ```
 
+### Bring Your Own Egress (External Recording URL)
+
+If you already run your **own** egress, you can disable SuperBryn's recording and
+supply your own recording URL instead. Disable our egress with
+`disable_recording=True`, then call `set_external_recording_url()` once your
+recording is ready (any time before the webhook fires on shutdown):
+
+```python
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    disable_recording=True,  # don't start SuperBryn's egress
+)
+
+# ... later, once your own egress has produced a file ...
+reachable = await webhook_handler.set_external_recording_url(
+    "https://my-bucket.s3.amazonaws.com/calls/room-123/call.mp3?X-Amz-Signature=...",
+    # probe=False,  # skip the call-time reachability check
+)
+```
+
+**Only public or pre-signed URLs are supported.** When you call this method the
+URL is validated at call time with a lightweight ranged GET (`Range: bytes=0-0`):
+
+- `200`/`206` → reachable; the URL is marked usable for mirroring.
+- `401`/`403` → private object or bad/expired signature — a clear error is logged
+  and mirroring should be skipped.
+- `404` → object not uploaded yet or wrong path (a timing/path issue).
+
+> A ranged **GET** is used instead of `HEAD` because S3 pre-signed URLs are signed
+> for a single HTTP method — a `HEAD` on a GET-signed URL returns `403` and would
+> falsely look private. Note the check reflects reachability *at call time*; a
+> pre-signed URL can still expire before a later (e.g. server-side) mirror runs,
+> so sign for a long-enough TTL or mirror promptly.
+
+The webhook payload gains two fields so the consumer can decide whether to mirror:
+
+```json
+{
+  "call": {
+    "recording_url": "https://my-bucket.s3.amazonaws.com/.../call.mp3?...",
+    "recording_url_source": "external",     // "superbryn_s3" for the managed flow
+    "recording_url_reachable": true          // call-time probe result (null if not probed)
+  }
+}
+```
+
+For the default managed flow these are `"superbryn_s3"` / `true` — the file is
+already in SuperBryn's bucket and needs no mirroring.
+
 ### Stereo Recording (Dual-Channel)
 
 Record in dual-channel stereo where the **agent is on the left channel** and **all other participants (caller/SIP) are on the right channel**. This is useful for separate-speaker transcription and analysis.
@@ -516,21 +566,6 @@ the call is ending. For example:
 - your app triggers a transfer to a human
 - you enforce a silence timeout or no-answer timeout
 - you intentionally delete the room during graceful shutdown
-
-### Passing Metadata via Job Context
-
-You can pass custom metadata when creating LiveKit jobs:
-
-```python
-# When creating a job
-job_metadata = {
-    "agent_id": "customer-support-bot",
-    "version_id": "v2.1.0",
-    "phone_number": "+1234567890"
-}
-```
-
-The webhook handler will automatically extract these values.
 
 ## 🐛 Troubleshooting
 

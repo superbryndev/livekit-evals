@@ -5,6 +5,7 @@ Captures events during agent session and sends webhook payload to Supabase edge 
 Designed to work with the webhooks-livekit edge function.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -23,7 +24,6 @@ from livekit.agents import (
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
-    get_job_context,
     metrics,
 )
 from livekit.agents.voice.events import AgentState, UserState
@@ -247,6 +247,10 @@ class WebhookHandler:
         self.recording_url: Optional[str] = None
         self.stereo_recording_url: Optional[str] = None
         self.egress_id: Optional[str] = None
+
+        # "superbryn_s3" (managed) | "external" (dev-supplied); reachable = probe result
+        self.recording_url_source: Optional[str] = None
+        self.recording_url_reachable: Optional[bool] = None
         
         # Session tracking
         self.started_at: Optional[datetime] = None
@@ -262,7 +266,10 @@ class WebhookHandler:
 
         # Tool call tracking
         self.tool_calls: list[dict[str, Any]] = []
-        
+
+        # Agent handoff tracking (non-message conversation items)
+        self.agent_handoffs: list[dict[str, Any]] = []
+
         # Usage metrics tracking
         self.usage_metrics = {
             "llm_model": None,
@@ -288,9 +295,11 @@ class WebhookHandler:
             "tts_ms": [],
         }
         
-        # Usage collector for metrics (following Whispey's approach)
-        self.usage_collector = metrics.UsageCollector()
-        
+        # Latest cumulative usage from the (non-deprecated) session_usage_updated
+        # event; used to backfill usage when the per-plugin metrics path can't
+        # observe it (notably realtime models). See _backfill_usage_from_session.
+        self._latest_session_usage: Any = None
+
         # Speech events tracking
         self.speech_events: list[dict[str, Any]] = []
 
@@ -423,6 +432,9 @@ class WebhookHandler:
                 egress_id=egress_id,
                 stereo_recording_url=recording_url if self.stereo_recording else None,
             )
+            # Managed egress writes to SuperBryn's bucket — no mirroring needed
+            self.recording_url_source = "superbryn_s3"
+            self.recording_url_reachable = True
             logger.info("Recording started successfully (%s): %s", mode, recording_url)
         else:
             logger.warning("Failed to start recording")
@@ -435,7 +447,83 @@ class WebhookHandler:
         """
         if self.recording_manager:
             await self.recording_manager.stop_egress()
-    
+
+    async def set_external_recording_url(
+        self,
+        recording_url: str,
+        *,
+        probe: bool = True,
+    ) -> bool:
+        """Attach a recording URL produced by the developer's own egress.
+
+        Use when you run your own egress (typically with ``disable_recording=True``)
+        and want the URL forwarded in the webhook. Call it once the recording
+        exists, any time before ``send_webhook`` fires on shutdown.
+
+        Only public or pre-signed URLs are supported. When ``probe=True`` the URL
+        is validated at call time with a ranged GET (200/206 reachable, 401/403
+        private, 404 not-yet/wrong-path). Reachability is checked *at call time*,
+        so sign pre-signed URLs for a long-enough TTL if mirroring happens later.
+
+        Returns True if probed and reachable, else False (the URL is stored
+        either way; ``probe=False`` skips the check and returns False).
+        """
+        if not recording_url or not recording_url.strip():
+            logger.warning("set_external_recording_url called with empty URL — ignored")
+            return False
+
+        recording_url = recording_url.strip()
+
+        reachable: Optional[bool] = None
+        if probe:
+            reachable, detail = await self._probe_recording_url(recording_url)
+            if reachable:
+                logger.info(
+                    "SUPERBRYN_EXTERNAL_RECORDING_URL_OK: %s (%s)",
+                    recording_url,
+                    detail,
+                )
+            else:
+                logger.error(
+                    "SUPERBRYN_EXTERNAL_RECORDING_URL_UNREACHABLE: %s — %s. "
+                    "Only public or pre-signed URLs are supported; mirroring will be skipped.",
+                    recording_url,
+                    detail,
+                )
+
+        self.set_recording_url(recording_url=recording_url)
+        self.recording_url_source = "external"
+        self.recording_url_reachable = reachable
+        return bool(reachable)
+
+    async def _probe_recording_url(self, url: str) -> tuple[bool, str]:
+        """Probe *url* with a ranged GET (``bytes=0-0``); return (reachable, detail)."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers={"Range": "bytes=0-0"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    status = resp.status
+                    if status in (200, 206):
+                        return True, f"reachable (status={status})"
+                    if status in (401, 403):
+                        return False, (
+                            f"not publicly fetchable (status={status}) — private "
+                            "object or bad/expired signature"
+                        )
+                    if status == 404:
+                        return False, (
+                            f"not found (status={status}) — object may not be "
+                            "uploaded yet or the path is wrong"
+                        )
+                    return False, f"unexpected status={status}"
+        except asyncio.TimeoutError:
+            return False, "probe timed out after 10s"
+        except Exception as e:  # noqa: BLE001
+            return False, f"probe failed: {e}"
+
     def _extract_session_config(self, session: AgentSession) -> None:
         """Extract model/provider info from session configuration using Whispey's approach.
 
@@ -686,25 +774,12 @@ class WebhookHandler:
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to get room.creation_time: %s", e)
         
-        # Extract agent_id, version_id, and phone_number from job context if available
-        job_ctx = get_job_context()
-        if job_ctx and hasattr(job_ctx, 'job') and job_ctx.job and hasattr(job_ctx.job, 'metadata'):
-            try:
-                metadata = json.loads(job_ctx.job.metadata) if isinstance(job_ctx.job.metadata, str) else job_ctx.job.metadata
-                self.agent_id = metadata.get('agent_id') or AGENT_CONFIG['id']
-                self.version_id = metadata.get('version_id') or AGENT_CONFIG['version_id']
-                self.phone_number = metadata.get('phone_number')
-                logger.info("Extracted from job metadata - agent_id: %s, version_id: %s, phone: %s",
-                          self.agent_id, self.version_id, self.phone_number)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to extract from job metadata: %s", e)
-        
-        # Fallback to config if not extracted from metadata
-        if not self.agent_id:
-            self.agent_id = AGENT_CONFIG['id']
-        if not self.version_id:
-            self.version_id = AGENT_CONFIG['version_id']
-        
+        # agent_id / version_id come from AGENT_CONFIG (env AGENT_ID / VERSION_ID,
+        # with defaults). phone_number, if any, is detected from SIP participant
+        # attributes below.
+        self.agent_id = AGENT_CONFIG['id']
+        self.version_id = AGENT_CONFIG['version_id']
+
         # Ensure agent_id is never None or empty (required by webhook endpoint)
         if not self.agent_id:
             self.agent_id = "livekit-agent-default"
@@ -736,19 +811,15 @@ class WebhookHandler:
         # Listen to conversation items for transcript
         session.on("conversation_item_added")(self._on_conversation_item_added)
         
-        # Listen to metrics for usage and latency
-        session.on("metrics_collected")(self._on_metrics_collected)
+        # Metrics: subscribe on the per-plugin metrics_collected surface (the
+        # session-level metrics_collected event is deprecated). See
+        # _subscribe_to_metrics for the outer+base subscription strategy.
+        self._subscribe_to_metrics(session)
 
-        # Defensive: also subscribe to the underlying base TTS/STT/LLM directly.
-        # ``session.on("metrics_collected")`` only fires for events that the
-        # outer wrapper re-emits, and several common custom wrappers
-        # (``SanitizedTTS``, ``VolumeTTS``, ``MixedAudioTTS``,
-        # ``NetworkGlitchTTS``) do not forward them.  Subscribing on the base
-        # provider lets us still observe the inner ``TTSMetrics`` /
-        # ``STTMetrics`` / ``LLMMetrics`` even in that case.  Dedup via
-        # ``self._seen_metrics`` prevents double-counting when the wrapper does
-        # forward (e.g. ``FallbackAdapter`` / ``StreamAdapter``).
-        self._subscribe_to_base_components(session)
+        # Realtime models emit metrics on an internal session we can't reach, so
+        # also track cumulative usage via the (non-deprecated) session_usage_updated
+        # event and use it to backfill usage at payload time.
+        session.on("session_usage_updated")(self._on_session_usage_updated)
         
         # Listen to user input for additional transcript metadata
         session.on("user_input_transcribed")(self._on_user_input_transcribed)
@@ -769,9 +840,24 @@ class WebhookHandler:
         logger.info("Event listeners attached to session")
     
     def _on_conversation_item_added(self, event: ConversationItemAddedEvent) -> None:
-        """Handle conversation item added event - fills in text for existing turns."""
-        item: ChatMessage = event.item
-        
+        """Handle conversation item added event - fills in text for existing turns.
+
+        The conversation stream can carry non-message items (e.g. ``AgentHandoff``
+        emitted on receptionist/agent handoffs), which have no ``role`` or
+        ``text_content``. Only ``ChatMessage`` items hold transcript text, so
+        gate on that (matching LiveKit's own handlers) and record handoffs
+        separately for observability instead of crashing on ``item.role``.
+        """
+        item = event.item
+
+        if not isinstance(item, ChatMessage):
+            item_type = getattr(item, "type", type(item).__name__)
+            if item_type == "agent_handoff":
+                self._track_agent_handoff(item)
+            else:
+                logger.info("Skipping non-message conversation item: type=%s", item_type)
+            return
+
         # Determine speaker role
         speaker = "user" if item.role == "user" else "assistant"
         
@@ -795,15 +881,57 @@ class WebhookHandler:
                 if speaker == "user":
                     self.last_user_turn_time_ms = turn["end_time_ms"] if turn["end_time_ms"] else turn["start_time_ms"]
                 
-                logger.info("✓ Filled text for %s turn: %s...", speaker, text[:500])
+                logger.debug("✓ Filled text for %s turn: %s...", speaker, text[:200])
                 turn_found = True
                 break
         
         if not turn_found:
-            logger.warning("No empty %s turn found to fill with text: %s...", speaker, text[:500])
-        
+            # Usually benign: the STT path (user_input_transcribed) already filled
+            # this turn before the message item arrived, so there's no empty turn
+            # left to fill and the text is already captured. Only note it (at debug)
+            # when the text isn't present anywhere — no noisy warning either way.
+            text_norm = text.strip()
+            already_captured = any(
+                turn["speaker"] == speaker and (turn.get("text") or "").strip() == text_norm
+                for turn in self.transcript_turns
+            )
+            if already_captured:
+                logger.debug("%s text already captured by another path; nothing to fill", speaker)
+            else:
+                logger.debug("No open %s turn to attach text to: %s...", speaker, text[:200])
+
         logger.debug("Transcript turn text updated: %s - %s...", speaker, text[:500])
-    
+
+    def _track_agent_handoff(self, item: Any) -> None:
+        """Record an ``AgentHandoff`` conversation item for observability.
+
+        Handoffs carry ``old_agent_id`` -> ``new_agent_id`` (and ``created_at``
+        in epoch seconds) but no transcript text; capture them separately so a
+        handoff is visible in the payload without touching transcript turns.
+        """
+        try:
+            created_at = getattr(item, "created_at", None)
+            if created_at and self.call_start_time_ms:
+                timestamp_ms = int(created_at * 1000) - self.call_start_time_ms
+            else:
+                current_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                timestamp_ms = current_ms - self.call_start_time_ms if self.call_start_time_ms else None
+
+            entry = {
+                "id": getattr(item, "id", None),
+                "old_agent_id": getattr(item, "old_agent_id", None),
+                "new_agent_id": getattr(item, "new_agent_id", None),
+                "timestamp_ms": timestamp_ms,
+            }
+            self.agent_handoffs.append(entry)
+            logger.info(
+                "Agent handoff captured: %s -> %s",
+                entry["old_agent_id"],
+                entry["new_agent_id"],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to track agent handoff: %s", e)
+
     def _on_user_input_transcribed(self, event: UserInputTranscribedEvent) -> None:
         """Handle user input transcribed event (final STT text + metadata).
 
@@ -861,7 +989,7 @@ class WebhookHandler:
                 target_turn.get("end_time_ms") if target_turn.get("end_time_ms") is not None else target_turn.get("start_time_ms")
             )
 
-            logger.info("✓ Filled text for user turn from STT: %s...", transcript_text[:500])
+            logger.debug("✓ Filled text for user turn from STT: %s...", transcript_text[:200])
 
         # Always store metadata if available
         target_turn["language"] = getattr(event, "language", None)
@@ -883,7 +1011,7 @@ class WebhookHandler:
             
             # START: non-speaking -> speaking
             if new_state == 'speaking' and old_state != 'speaking':
-                logger.info("Agent STARTED speaking at %dms", state_time_ms)
+                logger.debug("Agent STARTED speaking at %dms", state_time_ms)
                 turn = {
                     "speaker": "assistant",
                     "text": "",  # Will be filled by conversation_item_added
@@ -900,7 +1028,7 @@ class WebhookHandler:
                     "speaker_id": None,
                 }
                 self.transcript_turns.append(turn)
-                logger.info("✓ Created assistant turn at start")
+                logger.debug("✓ Created assistant turn at start")
             
             # END: speaking -> non-speaking
             elif old_state == 'speaking' and new_state != 'speaking':
@@ -931,7 +1059,7 @@ class WebhookHandler:
             
             # START: non-speaking -> speaking
             if new_state == 'speaking' and old_state != 'speaking':
-                logger.info("User STARTED speaking at %dms", state_time_ms)
+                logger.debug("User STARTED speaking at %dms", state_time_ms)
                 turn = {
                     "speaker": "user",
                     "text": "",  # Will be filled by user_input_transcribed/conversation_item_added
@@ -1082,8 +1210,7 @@ class WebhookHandler:
                 return
             self._seen_metrics.add(key)
 
-        # Use Whispey's approach: collect metrics and log them
-        self.usage_collector.collect(metrics_obj)
+        # Aggregation into usage/latency happens below; just log here.
         metrics.log_metrics(metrics_obj)
         
         # Handle different metric types using the discriminator field
@@ -1133,13 +1260,26 @@ class WebhookHandler:
         # but we log them for debugging
         # logger.debug("Metrics collected: %s", metrics_obj.type)
 
-    def _subscribe_to_base_components(self, session: AgentSession) -> None:
-        """Subscribe to the base TTS/STT/LLM components' ``metrics_collected``
-        events as a defensive backstop for wrappers that don't forward.
+    def _subscribe_to_metrics(self, session: AgentSession) -> None:
+        """Subscribe to per-plugin ``metrics_collected`` events for STT/LLM/TTS.
 
-        See the docstring on ``_on_base_metrics_collected`` for the dedup
-        strategy that prevents double-counting when the wrapper does forward.
+        This is the non-deprecated metrics surface — LiveKit's own AgentActivity
+        subscribes to the plugin instances the same way; the session-level
+        ``metrics_collected`` event is deprecated.
+
+        For each component we attach to two targets:
+
+          * the instance as held by the session (``session.tts`` etc.) — adapters
+            such as ``FallbackAdapter`` / ``StreamAdapter`` re-emit their inner
+            instances' metrics here, and
+          * the unwrapped base provider — to still observe metrics when a custom
+            wrapper (``SanitizedTTS``, ``VolumeTTS``, ``MixedAudioTTS``,
+            ``NetworkGlitchTTS``, ...) doesn't forward the event.
+
+        Both may deliver the same event; ``_on_metrics_collected`` de-duplicates
+        via ``self._seen_metrics`` on ``(type, request_id, segment_id)``.
         """
+        seen_targets: set[int] = set()
         for outer, inner_attrs, label in (
             (getattr(session, "tts", None), _TTS_INNER_ATTRS, "tts"),
             (getattr(session, "stt", None), _STT_INNER_ATTRS, "stt"),
@@ -1147,46 +1287,96 @@ class WebhookHandler:
         ):
             if outer is None:
                 continue
+
+            targets = [outer]
             try:
                 base = _unwrap_to_base_component(outer, inner_attrs)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to unwrap %s base component: %s", label, e)
-                continue
+                base = None
+            if base is not None and base is not outer:
+                targets.append(base)
 
-            if base is None or base is outer:
-                # No wrapper, or unwrap couldn't find a distinct inner — the
-                # existing ``session.on("metrics_collected")`` subscription is
-                # enough.
-                continue
-            if not hasattr(base, "on"):
-                continue
-
-            try:
-                base.on("metrics_collected", self._on_base_metrics_collected)
-                self._base_metric_subscriptions.append((base, self._on_base_metrics_collected))
-                logger.info(
-                    "Subscribed to base %s metrics directly: %s -> %s",
-                    label,
-                    getattr(outer, "__module__", type(outer).__name__),
-                    getattr(base, "__module__", type(base).__name__),
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to subscribe to base %s metrics: %s", label, e)
+            for target in targets:
+                if target is None or not hasattr(target, "on") or id(target) in seen_targets:
+                    continue
+                seen_targets.add(id(target))
+                try:
+                    target.on("metrics_collected", self._on_base_metrics_collected)
+                    self._base_metric_subscriptions.append((target, self._on_base_metrics_collected))
+                    logger.info(
+                        "Subscribed to %s metrics on %s",
+                        label,
+                        getattr(target, "__module__", type(target).__name__),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to subscribe to %s metrics: %s", label, e)
 
     def _on_base_metrics_collected(self, metrics_obj: Any) -> None:
-        """Handler for ``metrics_collected`` events emitted directly by the
-        base TTS/STT/LLM provider, bypassing wrappers that don't forward.
+        """Route a per-plugin ``metrics_collected`` event through the aggregator.
 
-        Wraps the raw metrics in a ``MetricsCollectedEvent`` (mirroring the
-        ``AgentSession`` shape) and routes through the same handler used by
-        the session-level subscription.  Dedup happens inside
-        ``_on_metrics_collected``, so whichever path fires first wins and the
-        other becomes a no-op for that ``(type, request_id, segment_id)``.
+        Per-plugin events deliver the raw metrics object; wrap it in a
+        ``MetricsCollectedEvent`` (mirroring the ``AgentSession`` shape) and hand
+        it to ``_on_metrics_collected``, which de-duplicates so a metric observed
+        on both the outer and the base target is only counted once.
         """
         try:
             self._on_metrics_collected(MetricsCollectedEvent(metrics=metrics_obj))
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to handle base-component metrics event: %s", e)
+
+    def _on_session_usage_updated(self, event: Any) -> None:
+        """Store the latest cumulative ``AgentSessionUsage`` (non-deprecated).
+
+        Backfills usage at payload time when the per-plugin path can't observe
+        it — notably realtime models, whose metrics are emitted on an internal
+        session we don't hold. See ``_backfill_usage_from_session``.
+        """
+        try:
+            self._latest_session_usage = getattr(event, "usage", None)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to store session usage: %s", e)
+
+    def _backfill_usage_from_session(self) -> None:
+        """Fill zero usage fields from the latest ``AgentSessionUsage``.
+
+        Only fills fields still at zero, so the per-plugin path (which also
+        yields latency) stays authoritative whenever it observed the metrics.
+        ``AgentSessionUsage.model_usage`` is a list of per-model entries tagged
+        ``llm_usage`` / ``tts_usage`` / ``stt_usage``.
+        """
+        usage = self._latest_session_usage
+        if usage is None:
+            return
+
+        llm_in = llm_out = tts_chars = 0
+        tts_audio = stt_audio = 0.0
+        for m in getattr(usage, "model_usage", None) or []:
+            mtype = getattr(m, "type", None)
+            if mtype == "llm_usage":
+                llm_in += getattr(m, "input_tokens", 0) or 0
+                llm_out += getattr(m, "output_tokens", 0) or 0
+            elif mtype == "tts_usage":
+                tts_chars += getattr(m, "characters_count", 0) or 0
+                tts_audio += getattr(m, "audio_duration", 0.0) or 0.0
+            elif mtype == "stt_usage":
+                stt_audio += getattr(m, "audio_duration", 0.0) or 0.0
+
+        um = self.usage_metrics
+        if not um["llm_input_tokens"] and llm_in:
+            um["llm_input_tokens"] = llm_in
+        if not um["llm_output_tokens"] and llm_out:
+            um["llm_output_tokens"] = llm_out
+        if not um["llm_total_tokens"] and (llm_in or llm_out):
+            um["llm_total_tokens"] = llm_in + llm_out
+        if not um["tts_characters"] and tts_chars:
+            um["tts_characters"] = tts_chars
+        if not um["tts_audio_duration_seconds"] and tts_audio:
+            um["tts_audio_duration_seconds"] = tts_audio
+        if not um["stt_duration_seconds"] and stt_audio:
+            um["stt_duration_seconds"] = stt_audio
+            if not um["audio_duration_seconds"]:
+                um["audio_duration_seconds"] = stt_audio
 
     def _calculate_average_latency(self, latencies: list[float]) -> float:
         """Calculate average latency from a list of measurements."""
@@ -1224,10 +1414,10 @@ class WebhookHandler:
         }
         avg_latency["total_ms"] = sum(avg_latency.values())
         
-        # Get usage summary from collector (Whispey's approach)
-        usage_summary = self.usage_collector.get_summary()
-        logger.info("Usage summary from collector: %s", usage_summary)
-        
+        # Backfill usage from session_usage_updated when the per-plugin path saw
+        # nothing (e.g. realtime models emit metrics on an internal session).
+        self._backfill_usage_from_session()
+
         # Debug: Log final usage metrics
         logger.info("Final usage metrics: %s", self.usage_metrics)
         
@@ -1266,8 +1456,12 @@ class WebhookHandler:
                     "turns": turns_with_text,
                 },
                 "tool_calls": self.tool_calls,
+                "agent_handoffs": self.agent_handoffs,
                 "recording_url": self._get_recording_url(),
                 "stereo_recording_url": self._get_stereo_recording_url(),
+                # provenance for the consumer's mirror decision (+ call-time probe result)
+                "recording_url_source": self.recording_url_source,
+                "recording_url_reachable": self.recording_url_reachable,
                 "metadata": {
                     "agent_id": self.agent_id,
                     "livekit_project_id": self.livekit_project_id,
