@@ -293,9 +293,11 @@ class WebhookHandler:
             "tts_ms": [],
         }
         
-        # Usage collector for metrics (following Whispey's approach)
-        self.usage_collector = metrics.UsageCollector()
-        
+        # Latest cumulative usage from the (non-deprecated) session_usage_updated
+        # event; used to backfill usage when the per-plugin metrics path can't
+        # observe it (notably realtime models). See _backfill_usage_from_session.
+        self._latest_session_usage: Any = None
+
         # Speech events tracking
         self.speech_events: list[dict[str, Any]] = []
 
@@ -820,19 +822,15 @@ class WebhookHandler:
         # Listen to conversation items for transcript
         session.on("conversation_item_added")(self._on_conversation_item_added)
         
-        # Listen to metrics for usage and latency
-        session.on("metrics_collected")(self._on_metrics_collected)
+        # Metrics: subscribe on the per-plugin metrics_collected surface (the
+        # session-level metrics_collected event is deprecated). See
+        # _subscribe_to_metrics for the outer+base subscription strategy.
+        self._subscribe_to_metrics(session)
 
-        # Defensive: also subscribe to the underlying base TTS/STT/LLM directly.
-        # ``session.on("metrics_collected")`` only fires for events that the
-        # outer wrapper re-emits, and several common custom wrappers
-        # (``SanitizedTTS``, ``VolumeTTS``, ``MixedAudioTTS``,
-        # ``NetworkGlitchTTS``) do not forward them.  Subscribing on the base
-        # provider lets us still observe the inner ``TTSMetrics`` /
-        # ``STTMetrics`` / ``LLMMetrics`` even in that case.  Dedup via
-        # ``self._seen_metrics`` prevents double-counting when the wrapper does
-        # forward (e.g. ``FallbackAdapter`` / ``StreamAdapter``).
-        self._subscribe_to_base_components(session)
+        # Realtime models emit metrics on an internal session we can't reach, so
+        # also track cumulative usage via the (non-deprecated) session_usage_updated
+        # event and use it to backfill usage at payload time.
+        session.on("session_usage_updated")(self._on_session_usage_updated)
         
         # Listen to user input for additional transcript metadata
         session.on("user_input_transcribed")(self._on_user_input_transcribed)
@@ -1166,8 +1164,7 @@ class WebhookHandler:
                 return
             self._seen_metrics.add(key)
 
-        # Use Whispey's approach: collect metrics and log them
-        self.usage_collector.collect(metrics_obj)
+        # Aggregation into usage/latency happens below; just log here.
         metrics.log_metrics(metrics_obj)
         
         # Handle different metric types using the discriminator field
@@ -1217,13 +1214,26 @@ class WebhookHandler:
         # but we log them for debugging
         # logger.debug("Metrics collected: %s", metrics_obj.type)
 
-    def _subscribe_to_base_components(self, session: AgentSession) -> None:
-        """Subscribe to the base TTS/STT/LLM components' ``metrics_collected``
-        events as a defensive backstop for wrappers that don't forward.
+    def _subscribe_to_metrics(self, session: AgentSession) -> None:
+        """Subscribe to per-plugin ``metrics_collected`` events for STT/LLM/TTS.
 
-        See the docstring on ``_on_base_metrics_collected`` for the dedup
-        strategy that prevents double-counting when the wrapper does forward.
+        This is the non-deprecated metrics surface — LiveKit's own AgentActivity
+        subscribes to the plugin instances the same way; the session-level
+        ``metrics_collected`` event is deprecated.
+
+        For each component we attach to two targets:
+
+          * the instance as held by the session (``session.tts`` etc.) — adapters
+            such as ``FallbackAdapter`` / ``StreamAdapter`` re-emit their inner
+            instances' metrics here, and
+          * the unwrapped base provider — to still observe metrics when a custom
+            wrapper (``SanitizedTTS``, ``VolumeTTS``, ``MixedAudioTTS``,
+            ``NetworkGlitchTTS``, ...) doesn't forward the event.
+
+        Both may deliver the same event; ``_on_metrics_collected`` de-duplicates
+        via ``self._seen_metrics`` on ``(type, request_id, segment_id)``.
         """
+        seen_targets: set[int] = set()
         for outer, inner_attrs, label in (
             (getattr(session, "tts", None), _TTS_INNER_ATTRS, "tts"),
             (getattr(session, "stt", None), _STT_INNER_ATTRS, "stt"),
@@ -1231,46 +1241,96 @@ class WebhookHandler:
         ):
             if outer is None:
                 continue
+
+            targets = [outer]
             try:
                 base = _unwrap_to_base_component(outer, inner_attrs)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to unwrap %s base component: %s", label, e)
-                continue
+                base = None
+            if base is not None and base is not outer:
+                targets.append(base)
 
-            if base is None or base is outer:
-                # No wrapper, or unwrap couldn't find a distinct inner — the
-                # existing ``session.on("metrics_collected")`` subscription is
-                # enough.
-                continue
-            if not hasattr(base, "on"):
-                continue
-
-            try:
-                base.on("metrics_collected", self._on_base_metrics_collected)
-                self._base_metric_subscriptions.append((base, self._on_base_metrics_collected))
-                logger.info(
-                    "Subscribed to base %s metrics directly: %s -> %s",
-                    label,
-                    getattr(outer, "__module__", type(outer).__name__),
-                    getattr(base, "__module__", type(base).__name__),
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to subscribe to base %s metrics: %s", label, e)
+            for target in targets:
+                if target is None or not hasattr(target, "on") or id(target) in seen_targets:
+                    continue
+                seen_targets.add(id(target))
+                try:
+                    target.on("metrics_collected", self._on_base_metrics_collected)
+                    self._base_metric_subscriptions.append((target, self._on_base_metrics_collected))
+                    logger.info(
+                        "Subscribed to %s metrics on %s",
+                        label,
+                        getattr(target, "__module__", type(target).__name__),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to subscribe to %s metrics: %s", label, e)
 
     def _on_base_metrics_collected(self, metrics_obj: Any) -> None:
-        """Handler for ``metrics_collected`` events emitted directly by the
-        base TTS/STT/LLM provider, bypassing wrappers that don't forward.
+        """Route a per-plugin ``metrics_collected`` event through the aggregator.
 
-        Wraps the raw metrics in a ``MetricsCollectedEvent`` (mirroring the
-        ``AgentSession`` shape) and routes through the same handler used by
-        the session-level subscription.  Dedup happens inside
-        ``_on_metrics_collected``, so whichever path fires first wins and the
-        other becomes a no-op for that ``(type, request_id, segment_id)``.
+        Per-plugin events deliver the raw metrics object; wrap it in a
+        ``MetricsCollectedEvent`` (mirroring the ``AgentSession`` shape) and hand
+        it to ``_on_metrics_collected``, which de-duplicates so a metric observed
+        on both the outer and the base target is only counted once.
         """
         try:
             self._on_metrics_collected(MetricsCollectedEvent(metrics=metrics_obj))
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to handle base-component metrics event: %s", e)
+
+    def _on_session_usage_updated(self, event: Any) -> None:
+        """Store the latest cumulative ``AgentSessionUsage`` (non-deprecated).
+
+        Backfills usage at payload time when the per-plugin path can't observe
+        it — notably realtime models, whose metrics are emitted on an internal
+        session we don't hold. See ``_backfill_usage_from_session``.
+        """
+        try:
+            self._latest_session_usage = getattr(event, "usage", None)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to store session usage: %s", e)
+
+    def _backfill_usage_from_session(self) -> None:
+        """Fill zero usage fields from the latest ``AgentSessionUsage``.
+
+        Only fills fields still at zero, so the per-plugin path (which also
+        yields latency) stays authoritative whenever it observed the metrics.
+        ``AgentSessionUsage.model_usage`` is a list of per-model entries tagged
+        ``llm_usage`` / ``tts_usage`` / ``stt_usage``.
+        """
+        usage = self._latest_session_usage
+        if usage is None:
+            return
+
+        llm_in = llm_out = tts_chars = 0
+        tts_audio = stt_audio = 0.0
+        for m in getattr(usage, "model_usage", None) or []:
+            mtype = getattr(m, "type", None)
+            if mtype == "llm_usage":
+                llm_in += getattr(m, "input_tokens", 0) or 0
+                llm_out += getattr(m, "output_tokens", 0) or 0
+            elif mtype == "tts_usage":
+                tts_chars += getattr(m, "characters_count", 0) or 0
+                tts_audio += getattr(m, "audio_duration", 0.0) or 0.0
+            elif mtype == "stt_usage":
+                stt_audio += getattr(m, "audio_duration", 0.0) or 0.0
+
+        um = self.usage_metrics
+        if not um["llm_input_tokens"] and llm_in:
+            um["llm_input_tokens"] = llm_in
+        if not um["llm_output_tokens"] and llm_out:
+            um["llm_output_tokens"] = llm_out
+        if not um["llm_total_tokens"] and (llm_in or llm_out):
+            um["llm_total_tokens"] = llm_in + llm_out
+        if not um["tts_characters"] and tts_chars:
+            um["tts_characters"] = tts_chars
+        if not um["tts_audio_duration_seconds"] and tts_audio:
+            um["tts_audio_duration_seconds"] = tts_audio
+        if not um["stt_duration_seconds"] and stt_audio:
+            um["stt_duration_seconds"] = stt_audio
+            if not um["audio_duration_seconds"]:
+                um["audio_duration_seconds"] = stt_audio
 
     def _calculate_average_latency(self, latencies: list[float]) -> float:
         """Calculate average latency from a list of measurements."""
@@ -1308,10 +1368,10 @@ class WebhookHandler:
         }
         avg_latency["total_ms"] = sum(avg_latency.values())
         
-        # Get usage summary from collector (Whispey's approach)
-        usage_summary = self.usage_collector.get_summary()
-        logger.info("Usage summary from collector: %s", usage_summary)
-        
+        # Backfill usage from session_usage_updated when the per-plugin path saw
+        # nothing (e.g. realtime models emit metrics on an internal session).
+        self._backfill_usage_from_session()
+
         # Debug: Log final usage metrics
         logger.info("Final usage metrics: %s", self.usage_metrics)
         

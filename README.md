@@ -227,7 +227,7 @@ VERSION_ID=v1.0.0
 
 ## 🔍 How It Works
 
-1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `metrics_collected`, `conversation_item_added`)
+1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `conversation_item_added`) and to the per-plugin `metrics_collected` events on STT/LLM/TTS (the non-deprecated metrics surface), with `session_usage_updated` as a fallback for realtime models
 2. **Data Aggregation:** Collects and processes events during the session
 3. **Auto-Detection:** Extracts configuration from session objects and job metadata
 4. **Webhook Delivery:** Sends comprehensive payload to webhook endpoint when session ends
