@@ -881,7 +881,7 @@ class WebhookHandler:
                 if speaker == "user":
                     self.last_user_turn_time_ms = turn["end_time_ms"] if turn["end_time_ms"] else turn["start_time_ms"]
                 
-                logger.info("✓ Filled text for %s turn: %s...", speaker, text[:500])
+                logger.debug("✓ Filled text for %s turn: %s...", speaker, text[:200])
                 turn_found = True
                 break
         
@@ -989,7 +989,7 @@ class WebhookHandler:
                 target_turn.get("end_time_ms") if target_turn.get("end_time_ms") is not None else target_turn.get("start_time_ms")
             )
 
-            logger.info("✓ Filled text for user turn from STT: %s...", transcript_text[:500])
+            logger.debug("✓ Filled text for user turn from STT: %s...", transcript_text[:200])
 
         # Always store metadata if available
         target_turn["language"] = getattr(event, "language", None)
@@ -1011,7 +1011,7 @@ class WebhookHandler:
             
             # START: non-speaking -> speaking
             if new_state == 'speaking' and old_state != 'speaking':
-                logger.info("Agent STARTED speaking at %dms", state_time_ms)
+                logger.debug("Agent STARTED speaking at %dms", state_time_ms)
                 turn = {
                     "speaker": "assistant",
                     "text": "",  # Will be filled by conversation_item_added
@@ -1028,7 +1028,7 @@ class WebhookHandler:
                     "speaker_id": None,
                 }
                 self.transcript_turns.append(turn)
-                logger.info("✓ Created assistant turn at start")
+                logger.debug("✓ Created assistant turn at start")
             
             # END: speaking -> non-speaking
             elif old_state == 'speaking' and new_state != 'speaking':
@@ -1059,7 +1059,7 @@ class WebhookHandler:
             
             # START: non-speaking -> speaking
             if new_state == 'speaking' and old_state != 'speaking':
-                logger.info("User STARTED speaking at %dms", state_time_ms)
+                logger.debug("User STARTED speaking at %dms", state_time_ms)
                 turn = {
                     "speaker": "user",
                     "text": "",  # Will be filled by user_input_transcribed/conversation_item_added
