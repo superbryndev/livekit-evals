@@ -24,7 +24,6 @@ from livekit.agents import (
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
-    get_job_context,
     metrics,
 )
 from livekit.agents.voice.events import AgentState, UserState
@@ -267,7 +266,10 @@ class WebhookHandler:
 
         # Tool call tracking
         self.tool_calls: list[dict[str, Any]] = []
-        
+
+        # Agent handoff tracking (non-message conversation items)
+        self.agent_handoffs: list[dict[str, Any]] = []
+
         # Usage metrics tracking
         self.usage_metrics = {
             "llm_model": None,
@@ -772,25 +774,12 @@ class WebhookHandler:
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to get room.creation_time: %s", e)
         
-        # Extract agent_id, version_id, and phone_number from job context if available
-        job_ctx = get_job_context()
-        if job_ctx and hasattr(job_ctx, 'job') and job_ctx.job and hasattr(job_ctx.job, 'metadata'):
-            try:
-                metadata = json.loads(job_ctx.job.metadata) if isinstance(job_ctx.job.metadata, str) else job_ctx.job.metadata
-                self.agent_id = metadata.get('agent_id') or AGENT_CONFIG['id']
-                self.version_id = metadata.get('version_id') or AGENT_CONFIG['version_id']
-                self.phone_number = metadata.get('phone_number')
-                logger.info("Extracted from job metadata - agent_id: %s, version_id: %s, phone: %s",
-                          self.agent_id, self.version_id, self.phone_number)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to extract from job metadata: %s", e)
-        
-        # Fallback to config if not extracted from metadata
-        if not self.agent_id:
-            self.agent_id = AGENT_CONFIG['id']
-        if not self.version_id:
-            self.version_id = AGENT_CONFIG['version_id']
-        
+        # agent_id / version_id come from AGENT_CONFIG (env AGENT_ID / VERSION_ID,
+        # with defaults). phone_number, if any, is detected from SIP participant
+        # attributes below.
+        self.agent_id = AGENT_CONFIG['id']
+        self.version_id = AGENT_CONFIG['version_id']
+
         # Ensure agent_id is never None or empty (required by webhook endpoint)
         if not self.agent_id:
             self.agent_id = "livekit-agent-default"
@@ -851,9 +840,24 @@ class WebhookHandler:
         logger.info("Event listeners attached to session")
     
     def _on_conversation_item_added(self, event: ConversationItemAddedEvent) -> None:
-        """Handle conversation item added event - fills in text for existing turns."""
-        item: ChatMessage = event.item
-        
+        """Handle conversation item added event - fills in text for existing turns.
+
+        The conversation stream can carry non-message items (e.g. ``AgentHandoff``
+        emitted on receptionist/agent handoffs), which have no ``role`` or
+        ``text_content``. Only ``ChatMessage`` items hold transcript text, so
+        gate on that (matching LiveKit's own handlers) and record handoffs
+        separately for observability instead of crashing on ``item.role``.
+        """
+        item = event.item
+
+        if not isinstance(item, ChatMessage):
+            item_type = getattr(item, "type", type(item).__name__)
+            if item_type == "agent_handoff":
+                self._track_agent_handoff(item)
+            else:
+                logger.info("Skipping non-message conversation item: type=%s", item_type)
+            return
+
         # Determine speaker role
         speaker = "user" if item.role == "user" else "assistant"
         
@@ -882,10 +886,52 @@ class WebhookHandler:
                 break
         
         if not turn_found:
-            logger.warning("No empty %s turn found to fill with text: %s...", speaker, text[:500])
-        
+            # Usually benign: the STT path (user_input_transcribed) already filled
+            # this turn before the message item arrived, so there's no empty turn
+            # left to fill and the text is already captured. Only note it (at debug)
+            # when the text isn't present anywhere — no noisy warning either way.
+            text_norm = text.strip()
+            already_captured = any(
+                turn["speaker"] == speaker and (turn.get("text") or "").strip() == text_norm
+                for turn in self.transcript_turns
+            )
+            if already_captured:
+                logger.debug("%s text already captured by another path; nothing to fill", speaker)
+            else:
+                logger.debug("No open %s turn to attach text to: %s...", speaker, text[:200])
+
         logger.debug("Transcript turn text updated: %s - %s...", speaker, text[:500])
-    
+
+    def _track_agent_handoff(self, item: Any) -> None:
+        """Record an ``AgentHandoff`` conversation item for observability.
+
+        Handoffs carry ``old_agent_id`` -> ``new_agent_id`` (and ``created_at``
+        in epoch seconds) but no transcript text; capture them separately so a
+        handoff is visible in the payload without touching transcript turns.
+        """
+        try:
+            created_at = getattr(item, "created_at", None)
+            if created_at and self.call_start_time_ms:
+                timestamp_ms = int(created_at * 1000) - self.call_start_time_ms
+            else:
+                current_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                timestamp_ms = current_ms - self.call_start_time_ms if self.call_start_time_ms else None
+
+            entry = {
+                "id": getattr(item, "id", None),
+                "old_agent_id": getattr(item, "old_agent_id", None),
+                "new_agent_id": getattr(item, "new_agent_id", None),
+                "timestamp_ms": timestamp_ms,
+            }
+            self.agent_handoffs.append(entry)
+            logger.info(
+                "Agent handoff captured: %s -> %s",
+                entry["old_agent_id"],
+                entry["new_agent_id"],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to track agent handoff: %s", e)
+
     def _on_user_input_transcribed(self, event: UserInputTranscribedEvent) -> None:
         """Handle user input transcribed event (final STT text + metadata).
 
@@ -1410,6 +1456,7 @@ class WebhookHandler:
                     "turns": turns_with_text,
                 },
                 "tool_calls": self.tool_calls,
+                "agent_handoffs": self.agent_handoffs,
                 "recording_url": self._get_recording_url(),
                 "stereo_recording_url": self._get_stereo_recording_url(),
                 # provenance for the consumer's mirror decision (+ call-time probe result)

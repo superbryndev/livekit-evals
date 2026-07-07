@@ -150,8 +150,8 @@ if __name__ == "__main__":
 |----------|----------|-------------|---------|
 | `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication and call recording | - |
 | `LIVEKIT_PROJECT_ID` | ⚪ Optional | LiveKit project ID | Auto-detected from `LIVEKIT_URL` |
-| `AGENT_ID` | ⚪ Optional | Unique agent identifier | Auto-detected from job metadata or `"livekit-agent"` |
-| `VERSION_ID` | ⚪ Optional | Agent version identifier | Auto-detected from job metadata or `"v1"` |
+| `AGENT_ID` | ⚪ Optional | Unique agent identifier | `"livekit-agent"` |
+| `VERSION_ID` | ⚪ Optional | Agent version identifier | `"v1"` |
 
 **Note:** Call recording is **enabled by default**. Temporary S3 credentials are fetched automatically using your `SUPERBRYN_API_KEY` -- no S3 configuration needed.
 
@@ -229,7 +229,7 @@ VERSION_ID=v1.0.0
 
 1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `conversation_item_added`) and to the per-plugin `metrics_collected` events on STT/LLM/TTS (the non-deprecated metrics surface), with `session_usage_updated` as a fallback for realtime models
 2. **Data Aggregation:** Collects and processes events during the session
-3. **Auto-Detection:** Extracts configuration from session objects and job metadata
+3. **Auto-Detection:** Extracts configuration from session objects
 4. **Webhook Delivery:** Sends comprehensive payload to webhook endpoint when session ends
 
 ### Webhook Payload Format
@@ -566,21 +566,6 @@ the call is ending. For example:
 - your app triggers a transfer to a human
 - you enforce a silence timeout or no-answer timeout
 - you intentionally delete the room during graceful shutdown
-
-### Passing Metadata via Job Context
-
-You can pass custom metadata when creating LiveKit jobs:
-
-```python
-# When creating a job
-job_metadata = {
-    "agent_id": "customer-support-bot",
-    "version_id": "v2.1.0",
-    "phone_number": "+1234567890"
-}
-```
-
-The webhook handler will automatically extract these values.
 
 ## 🐛 Troubleshooting
 
