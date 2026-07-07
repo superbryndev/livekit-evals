@@ -441,6 +441,56 @@ webhook_handler = create_webhook_handler(
 )
 ```
 
+### Bring Your Own Egress (External Recording URL)
+
+If you already run your **own** egress, you can disable SuperBryn's recording and
+supply your own recording URL instead. Disable our egress with
+`disable_recording=True`, then call `set_external_recording_url()` once your
+recording is ready (any time before the webhook fires on shutdown):
+
+```python
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    disable_recording=True,  # don't start SuperBryn's egress
+)
+
+# ... later, once your own egress has produced a file ...
+reachable = await webhook_handler.set_external_recording_url(
+    "https://my-bucket.s3.amazonaws.com/calls/room-123/call.mp3?X-Amz-Signature=...",
+    # probe=False,  # skip the call-time reachability check
+)
+```
+
+**Only public or pre-signed URLs are supported.** When you call this method the
+URL is validated at call time with a lightweight ranged GET (`Range: bytes=0-0`):
+
+- `200`/`206` → reachable; the URL is marked usable for mirroring.
+- `401`/`403` → private object or bad/expired signature — a clear error is logged
+  and mirroring should be skipped.
+- `404` → object not uploaded yet or wrong path (a timing/path issue).
+
+> A ranged **GET** is used instead of `HEAD` because S3 pre-signed URLs are signed
+> for a single HTTP method — a `HEAD` on a GET-signed URL returns `403` and would
+> falsely look private. Note the check reflects reachability *at call time*; a
+> pre-signed URL can still expire before a later (e.g. server-side) mirror runs,
+> so sign for a long-enough TTL or mirror promptly.
+
+The webhook payload gains two fields so the consumer can decide whether to mirror:
+
+```json
+{
+  "call": {
+    "recording_url": "https://my-bucket.s3.amazonaws.com/.../call.mp3?...",
+    "recording_url_source": "external",     // "superbryn_s3" for the managed flow
+    "recording_url_reachable": true          // call-time probe result (null if not probed)
+  }
+}
+```
+
+For the default managed flow these are `"superbryn_s3"` / `true` — the file is
+already in SuperBryn's bucket and needs no mirroring.
+
 ### Stereo Recording (Dual-Channel)
 
 Record in dual-channel stereo where the **agent is on the left channel** and **all other participants (caller/SIP) are on the right channel**. This is useful for separate-speaker transcription and analysis.

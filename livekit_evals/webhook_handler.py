@@ -5,6 +5,7 @@ Captures events during agent session and sends webhook payload to Supabase edge 
 Designed to work with the webhooks-livekit edge function.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -247,6 +248,10 @@ class WebhookHandler:
         self.recording_url: Optional[str] = None
         self.stereo_recording_url: Optional[str] = None
         self.egress_id: Optional[str] = None
+
+        # "superbryn_s3" (managed) | "external" (dev-supplied); reachable = probe result
+        self.recording_url_source: Optional[str] = None
+        self.recording_url_reachable: Optional[bool] = None
         
         # Session tracking
         self.started_at: Optional[datetime] = None
@@ -423,6 +428,9 @@ class WebhookHandler:
                 egress_id=egress_id,
                 stereo_recording_url=recording_url if self.stereo_recording else None,
             )
+            # Managed egress writes to SuperBryn's bucket — no mirroring needed
+            self.recording_url_source = "superbryn_s3"
+            self.recording_url_reachable = True
             logger.info("Recording started successfully (%s): %s", mode, recording_url)
         else:
             logger.warning("Failed to start recording")
@@ -435,7 +443,83 @@ class WebhookHandler:
         """
         if self.recording_manager:
             await self.recording_manager.stop_egress()
-    
+
+    async def set_external_recording_url(
+        self,
+        recording_url: str,
+        *,
+        probe: bool = True,
+    ) -> bool:
+        """Attach a recording URL produced by the developer's own egress.
+
+        Use when you run your own egress (typically with ``disable_recording=True``)
+        and want the URL forwarded in the webhook. Call it once the recording
+        exists, any time before ``send_webhook`` fires on shutdown.
+
+        Only public or pre-signed URLs are supported. When ``probe=True`` the URL
+        is validated at call time with a ranged GET (200/206 reachable, 401/403
+        private, 404 not-yet/wrong-path). Reachability is checked *at call time*,
+        so sign pre-signed URLs for a long-enough TTL if mirroring happens later.
+
+        Returns True if probed and reachable, else False (the URL is stored
+        either way; ``probe=False`` skips the check and returns False).
+        """
+        if not recording_url or not recording_url.strip():
+            logger.warning("set_external_recording_url called with empty URL — ignored")
+            return False
+
+        recording_url = recording_url.strip()
+
+        reachable: Optional[bool] = None
+        if probe:
+            reachable, detail = await self._probe_recording_url(recording_url)
+            if reachable:
+                logger.info(
+                    "SUPERBRYN_EXTERNAL_RECORDING_URL_OK: %s (%s)",
+                    recording_url,
+                    detail,
+                )
+            else:
+                logger.error(
+                    "SUPERBRYN_EXTERNAL_RECORDING_URL_UNREACHABLE: %s — %s. "
+                    "Only public or pre-signed URLs are supported; mirroring will be skipped.",
+                    recording_url,
+                    detail,
+                )
+
+        self.set_recording_url(recording_url=recording_url)
+        self.recording_url_source = "external"
+        self.recording_url_reachable = reachable
+        return bool(reachable)
+
+    async def _probe_recording_url(self, url: str) -> tuple[bool, str]:
+        """Probe *url* with a ranged GET (``bytes=0-0``); return (reachable, detail)."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers={"Range": "bytes=0-0"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    status = resp.status
+                    if status in (200, 206):
+                        return True, f"reachable (status={status})"
+                    if status in (401, 403):
+                        return False, (
+                            f"not publicly fetchable (status={status}) — private "
+                            "object or bad/expired signature"
+                        )
+                    if status == 404:
+                        return False, (
+                            f"not found (status={status}) — object may not be "
+                            "uploaded yet or the path is wrong"
+                        )
+                    return False, f"unexpected status={status}"
+        except asyncio.TimeoutError:
+            return False, "probe timed out after 10s"
+        except Exception as e:  # noqa: BLE001
+            return False, f"probe failed: {e}"
+
     def _extract_session_config(self, session: AgentSession) -> None:
         """Extract model/provider info from session configuration using Whispey's approach.
 
@@ -1268,6 +1352,9 @@ class WebhookHandler:
                 "tool_calls": self.tool_calls,
                 "recording_url": self._get_recording_url(),
                 "stereo_recording_url": self._get_stereo_recording_url(),
+                # provenance for the consumer's mirror decision (+ call-time probe result)
+                "recording_url_source": self.recording_url_source,
+                "recording_url_reachable": self.recording_url_reachable,
                 "metadata": {
                     "agent_id": self.agent_id,
                     "livekit_project_id": self.livekit_project_id,
