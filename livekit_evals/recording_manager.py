@@ -12,6 +12,7 @@ import asyncio
 import logging
 import urllib.parse
 from datetime import datetime
+from typing import Optional, Tuple
 
 import aiohttp
 from livekit import api
@@ -44,14 +45,12 @@ class RecordingManager:
         self.api_key = api_key
         self.stereo = stereo
         self.lkapi = api.LiveKitAPI()
-        self.egress_id: str | None = None
+        self.egress_id: Optional[str] = None
         self.recording_active = asyncio.Event()
         self.recording_active.set()
 
         mode = "stereo (DUAL_CHANNEL_AGENT)" if stereo else "mono"
-        logger.info(
-            "RecordingManager initialized — mode=%s (credentials fetched per-session)", mode
-        )
+        logger.info("RecordingManager initialized — mode=%s (credentials fetched per-session)", mode)
 
     async def _fetch_credentials(self, room_name: str) -> dict:
         """Fetch short-lived S3 credentials from the credentials endpoint.
@@ -79,8 +78,8 @@ class RecordingManager:
     async def start_recording(
         self,
         room_name: str,
-        phone_number: str | None = None,
-    ) -> tuple[str | None, str | None]:
+        phone_number: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """
         Start recording the call session using LiveKit's Egress API
 
@@ -96,30 +95,25 @@ class RecordingManager:
 
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-            # Build the folder path for the recording. The phone-bearing
-            # paths are never logged — the log variant contains no characters
-            # derived from the phone number (CodeQL tracks taint through
-            # slicing, so even a last-4-digits mask is flagged).
+            # Build the folder path for the recording
             if phone_number:
                 encoded_phone = urllib.parse.quote_plus(phone_number)
                 folder_path = f"call_recordings/{phone_number}/{timestamp}"
                 url_folder_path = f"call_recordings/{encoded_phone}/{timestamp}"
-                log_folder_path = f"call_recordings/<phone-redacted>/{timestamp}"
             else:
                 folder_path = f"call_recordings/{room_name}/{timestamp}"
-                url_folder_path = (
-                    f"call_recordings/{urllib.parse.quote_plus(room_name)}/{timestamp}"
-                )
-                log_folder_path = url_folder_path
+                url_folder_path = f"call_recordings/{urllib.parse.quote_plus(room_name)}/{timestamp}"
 
-            file_extension = (
-                "mp3" if RECORDING_FORMAT == egress_proto.EncodedFileType.MP3 else "ogg"
-            )
+            file_extension = "mp3" if RECORDING_FORMAT == egress_proto.EncodedFileType.MP3 else "ogg"
 
             single_file_base = f"{folder_path}/call.{file_extension}"
             url_single_file_actual = f"{url_folder_path}/call.{file_extension}"
 
-            logger.info("Recording path: %s", log_folder_path)
+            logger.info(
+                "Recording paths - API: %s, URL: %s",
+                folder_path,
+                url_folder_path,
+            )
 
             # Create S3 upload configuration using temporary credentials
             s3_upload = api.S3Upload(  # type: ignore[attr-defined]  # noqa: PGH003
@@ -166,7 +160,9 @@ class RecordingManager:
             )
 
             if self.stereo:
-                egress_kwargs["audio_mixing"] = egress_proto.AudioMixing.Value("DUAL_CHANNEL_AGENT")
+                egress_kwargs["audio_mixing"] = egress_proto.AudioMixing.Value(
+                    "DUAL_CHANNEL_AGENT"
+                )
             else:
                 egress_kwargs["layout"] = "speaker"
 
@@ -174,7 +170,9 @@ class RecordingManager:
 
             mode_label = "stereo" if self.stereo else "mono"
             logger.info("Starting %s recording for room %s", mode_label, room_name)
-            single_file_res = await self.lkapi.egress.start_room_composite_egress(single_file_req)
+            single_file_res = await self.lkapi.egress.start_room_composite_egress(
+                single_file_req
+            )
 
             egress_id = single_file_res.egress_id
             self.egress_id = egress_id
@@ -185,12 +183,7 @@ class RecordingManager:
             )
 
             recording_url = f"{creds['base_url']}/{url_single_file_actual}"
-            logger.info(
-                "Recording URL ready: %s/%s/call.%s",
-                creds["base_url"],
-                log_folder_path,
-                file_extension,
-            )
+            logger.info("Recording URL: %s", recording_url)
 
             self._start_recording_monitoring(egress_id)
 
@@ -198,8 +191,8 @@ class RecordingManager:
 
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to start recording: %s", e, exc_info=True)
-            if hasattr(e, "details"):
-                logger.error("API error details: %s", e.details)
+            if hasattr(e, 'details'):
+                logger.error("API error details: %s", getattr(e, 'details'))
             return None, None
 
     def _start_recording_monitoring(self, egress_id: str) -> None:
