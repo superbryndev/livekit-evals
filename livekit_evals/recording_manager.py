@@ -96,16 +96,19 @@ class RecordingManager:
 
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-            # Build the folder path for the recording
+            # Build the folder path for the recording. The phone-bearing
+            # paths are never logged — only the masked variant below is.
             if phone_number:
                 encoded_phone = urllib.parse.quote_plus(phone_number)
                 folder_path = f"call_recordings/{phone_number}/{timestamp}"
                 url_folder_path = f"call_recordings/{encoded_phone}/{timestamp}"
+                log_folder_path = f"call_recordings/***{phone_number[-4:]}/{timestamp}"
             else:
                 folder_path = f"call_recordings/{room_name}/{timestamp}"
                 url_folder_path = (
                     f"call_recordings/{urllib.parse.quote_plus(room_name)}/{timestamp}"
                 )
+                log_folder_path = url_folder_path
 
             file_extension = (
                 "mp3" if RECORDING_FORMAT == egress_proto.EncodedFileType.MP3 else "ogg"
@@ -114,11 +117,7 @@ class RecordingManager:
             single_file_base = f"{folder_path}/call.{file_extension}"
             url_single_file_actual = f"{url_folder_path}/call.{file_extension}"
 
-            logger.info(
-                "Recording paths - API: %s, URL: %s",
-                folder_path,
-                url_folder_path,
-            )
+            logger.info("Recording path: %s", log_folder_path)
 
             # Create S3 upload configuration using temporary credentials
             s3_upload = api.S3Upload(  # type: ignore[attr-defined]  # noqa: PGH003
@@ -184,7 +183,12 @@ class RecordingManager:
             )
 
             recording_url = f"{creds['base_url']}/{url_single_file_actual}"
-            logger.info("Recording URL: %s", recording_url)
+            logger.info(
+                "Recording URL ready: %s/%s/call.%s",
+                creds["base_url"],
+                log_folder_path,
+                file_extension,
+            )
 
             self._start_recording_monitoring(egress_id)
 

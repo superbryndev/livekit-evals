@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -45,13 +46,36 @@ logger = logging.getLogger("webhook_handler")
 
 
 def _mask_api_key(api_key: str | None) -> str:
-    """Return a redacted representation of an API key safe for logging."""
+    """Return a redacted representation of an API key safe for logging.
+
+    Deliberately contains no key material at all (not even a prefix) so
+    static analysis and log scrapers never see part of a credential.
+    """
     if not api_key:
         return "<not-set>"
-    key_len = len(api_key)
-    if key_len <= 8:
-        return "*" * key_len
-    return f"{api_key[:4]}...{api_key[-4:]} (len={key_len})"
+    return f"<set len={len(api_key)}>"
+
+
+def _mask_phone(value: str | None) -> str:
+    """Redact a phone number (or phone-like identity) for logging."""
+    if not value:
+        return "<none>"
+    return f"***{value[-4:]}" if len(value) > 4 else "***"
+
+
+def _redact_url(url: str) -> str:
+    """Strip the query string from a URL before logging.
+
+    Pre-signed URLs carry their signature/credentials in query parameters,
+    which must never end up in logs.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<unparseable-url>"
+    if not parts.query:
+        return url
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")) + "?<redacted>"
 
 
 # Attribute names commonly used by TTS/STT/LLM wrappers to reference the
@@ -480,14 +504,14 @@ class WebhookHandler:
             if reachable:
                 logger.info(
                     "SUPERBRYN_EXTERNAL_RECORDING_URL_OK: %s (%s)",
-                    recording_url,
+                    _redact_url(recording_url),
                     detail,
                 )
             else:
                 logger.error(
                     "SUPERBRYN_EXTERNAL_RECORDING_URL_UNREACHABLE: %s — %s. "
                     "Only public or pre-signed URLs are supported; mirroring will be skipped.",
-                    recording_url,
+                    _redact_url(recording_url),
                     detail,
                 )
 
@@ -741,7 +765,8 @@ class WebhookHandler:
                         if "sip.phoneNumber" in attributes and not self.phone_number:
                             self.phone_number = attributes["sip.phoneNumber"]
                             logger.info(
-                                "Extracted phone number from SIP attributes: %s", self.phone_number
+                                "Extracted phone number from SIP attributes: %s",
+                                _mask_phone(self.phone_number),
                             )
 
                         return
@@ -752,14 +777,17 @@ class WebhookHandler:
                     # SIP participants often have phone number-like identities
                     if identity and (identity.startswith("+") or identity.startswith("sip:")):
                         self.sip_trunking_enabled = True
-                        logger.info("SIP trunking detected from participant identity: %s", identity)
+                        logger.info(
+                            "SIP trunking detected from participant identity: %s",
+                            _mask_phone(identity),
+                        )
 
                         # Extract phone number from identity if not already set
                         if not self.phone_number and identity.startswith("+"):
                             self.phone_number = identity
                             logger.info(
                                 "Extracted phone number from participant identity: %s",
-                                self.phone_number,
+                                _mask_phone(self.phone_number),
                             )
 
                         return
