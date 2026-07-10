@@ -57,10 +57,13 @@ def _mask_api_key(api_key: str | None) -> str:
 
 
 def _mask_phone(value: str | None) -> str:
-    """Redact a phone number (or phone-like identity) for logging."""
-    if not value:
-        return "<none>"
-    return f"***{value[-4:]}" if len(value) > 4 else "***"
+    """Redact a phone number (or phone-like identity) for logging.
+
+    Returns no characters derived from the input — CodeQL tracks taint
+    through slicing, so even a last-4-digits mask is flagged as clear-text
+    logging of sensitive data.
+    """
+    return "<redacted>" if value else "<none>"
 
 
 def _redact_url(url: str) -> str:

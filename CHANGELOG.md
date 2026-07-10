@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TTS voice extraction for the ElevenLabs plugin: the voice is stored under `_opts.voice_id`, which the extractor's candidate paths didn't cover, so the manifest's `tts.voice_id` and the derived top-level `voice` block were silently missing. `_opts.voice_id` / `opts.voice_id` added to the candidate list.
 
 ### Security
-- Sensitive data is no longer written to logs in clear text (flagged by CodeQL). Phone numbers extracted from SIP attributes/identities and embedded in recording paths/URLs are now masked to their last 4 digits; the startup config log shows only the API key's presence and length (previously it included a key prefix/suffix); external recording URLs are logged with their query string stripped so pre-signed URL signatures never reach logs.
+- Sensitive data is no longer written to logs in clear text (flagged by CodeQL). Phone numbers extracted from SIP attributes/identities and embedded in recording paths/URLs are now fully redacted from logs (no derived characters at all); the startup config log shows only the API key's presence and length (previously it included a key prefix/suffix); external recording URLs are logged with their query string stripped so pre-signed URL signatures never reach logs.
 
 ### Changed
 - Minimum supported Python is now 3.10 (`requires-python >= 3.10`). The previous 3.9 claim was already unachievable — `livekit-agents` itself requires 3.10-only typing features — so installs on 3.9 now fail clearly at dependency resolution instead of at import time.

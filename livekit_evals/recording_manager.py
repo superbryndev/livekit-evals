@@ -97,12 +97,14 @@ class RecordingManager:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
             # Build the folder path for the recording. The phone-bearing
-            # paths are never logged — only the masked variant below is.
+            # paths are never logged — the log variant contains no characters
+            # derived from the phone number (CodeQL tracks taint through
+            # slicing, so even a last-4-digits mask is flagged).
             if phone_number:
                 encoded_phone = urllib.parse.quote_plus(phone_number)
                 folder_path = f"call_recordings/{phone_number}/{timestamp}"
                 url_folder_path = f"call_recordings/{encoded_phone}/{timestamp}"
-                log_folder_path = f"call_recordings/***{phone_number[-4:]}/{timestamp}"
+                log_folder_path = f"call_recordings/<phone-redacted>/{timestamp}"
             else:
                 folder_path = f"call_recordings/{room_name}/{timestamp}"
                 url_folder_path = (
