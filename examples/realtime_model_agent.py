@@ -6,6 +6,7 @@ The integration works identically with both voice pipelines and realtime models.
 """
 
 import logging
+
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
@@ -26,7 +27,7 @@ load_dotenv(".env")
 
 class Assistant(Agent):
     """A simple voice AI assistant using OpenAI Realtime API."""
-    
+
     def __init__(self) -> None:
         super().__init__(
             instructions="""You are a helpful voice AI assistant.
@@ -37,17 +38,14 @@ class Assistant(Agent):
 
 async def entrypoint(ctx: JobContext):
     """Main entrypoint for the LiveKit agent with Realtime Model."""
-    
+
     # Logging setup
     ctx.log_context_fields = {"room": ctx.room.name}
 
     # ============================================================================
     # LIVEKIT-EVALS INTEGRATION - STEP 1: Create webhook handler
     # ============================================================================
-    webhook_handler = create_webhook_handler(
-        room=ctx.room,
-        is_deployed_on_lk_cloud=True
-    )
+    webhook_handler = create_webhook_handler(room=ctx.room, is_deployed_on_lk_cloud=True)
 
     # Set up session with OpenAI Realtime Model
     # This is simpler than voice pipeline - no separate STT/TTS/LLM configuration
@@ -76,4 +74,3 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-

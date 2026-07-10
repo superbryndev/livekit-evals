@@ -1,7 +1,7 @@
 # LiveKit Evals
 
 [![PyPI version](https://badge.fury.io/py/livekit-evals.svg)](https://badge.fury.io/py/livekit-evals)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Track and evaluate your LiveKit voice AI agents with just 3 lines of code.**
@@ -331,6 +331,39 @@ VERSION_ID=v1.0.0
 ```
 
 ## 🛠️ Advanced Usage
+
+### Agent Config Sync (opt-in)
+
+Push your agent's configuration to SuperBryn as a reviewable draft. Requires an **agent-scoped** API key; nothing syncs unless you call it explicitly:
+
+```python
+from livekit_evals import sync_config
+
+sync_config(
+    agent,
+    api_key="sk_agent_...",           # or SUPERBRYN_API_KEY
+    identity={"name": "Support Agent", "type": "inbound", "agent_modality": "voice"},
+    policy_guardrails=open("guardrails.md").read(),
+)
+```
+
+The helper reads `agent.llm` / `agent.stt` / `agent.tts` to fill the pipeline blocks, uses `agent.instructions` as the behavior prompt, and maps `agent.tools` (function tools) to `tools` — explicit `behavior=` / `tools=` overrides always win (public attributes only — your provider API keys are never read). The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_agent(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
+
+Override sections accept exactly the fields of the canonical manifest schema (unknown keys raise `ValueError` locally — the endpoint rejects them anyway):
+
+| Keyword | Fields |
+|---|---|
+| `identity` | `name`, `type` (`inbound`/`outbound`), `agent_modality` (`voice`/`chat`), `description`, `pain_point`, `gender`, `age`, `dob` |
+| `behavior` | `prompt`, `flow` |
+| `tools` | list of `{name, description, schema, server: {type, url}}` |
+| `language` | `primary_language`, `additional_languages: [{code, priority}]` |
+| `telephony` | `phone_number`, `ivr_config: {enabled, number}` |
+
+Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurrency_calls`.
+
+For the sections the agent object can't expose, pass `scan_root="path/to/project"` to statically scan your source for them (`agent_name=`, `phone_number=`, `POLICY_GUARDRAILS = "..."`, `concurrency_calls=`, ...). Precedence per section: explicit kwarg > runtime extraction > source scan. The scan is read-only and best-effort — see `livekit_evals/codescan.py`.
+
+Docs: https://docs.superbryn.com/advanced/agent-sync
 
 ### Custom Data
 

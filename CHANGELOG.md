@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Tool call capture via the LiveKit `function_tools_executed` event. Every tool/function invoked by the agent during a session is now collected and emitted as `payload["call"]["tool_calls"]` — a list of objects with `id`, `function_name`, `arguments` (raw JSON string), `result`, `is_error`, `start_ms`, `end_ms`, and `timestamp_ms`. Timing offsets are derived from `FunctionCall.created_at` and `FunctionCallOutput.created_at` (ms from call start), matching the canonical shape used by VAPI and Retell in the orchestration layer.
+- Static source scanning for config sync (`livekit_evals.codescan`, opt-in via `scan_root=` on `sync_config` / `build_manifest_from_agent`). Extracts identity, telephony, policy guardrails, additional details, concurrency, and a fallback behavior prompt from the customer's own agent source. Precedence per section: explicit keyword override > runtime extraction > source scan.
+
+### Fixed
+- TTS voice extraction for the ElevenLabs plugin: the voice is stored under `_opts.voice_id`, which the extractor's candidate paths didn't cover, so the manifest's `tts.voice_id` and the derived top-level `voice` block were silently missing. `_opts.voice_id` / `opts.voice_id` added to the candidate list.
+
+### Changed
+- Minimum supported Python is now 3.10 (`requires-python >= 3.10`). The previous 3.9 claim was already unachievable — `livekit-agents` itself requires 3.10-only typing features — so installs on 3.9 now fail clearly at dependency resolution instead of at import time.
+
+## [0.3.0] - 2026-07-09
+
+### Added
+- Agent config sync (opt-in). New `livekit_evals.config_sync` module with `build_manifest_from_agent(agent, ...)`, `sync_manifest(manifest, ...)`, `sync_config(agent, ...)`, and `async_sync_config(agent, ...)`. Builds a SuperBryn `AgentSyncManifest` from a LiveKit `Agent`/`AgentSession` (reading `agent.llm` / `agent.stt` / `agent.tts` public attributes and `agent.instructions`) and pushes it to `POST {BASE_URL}/public-api/v1/agents/me/sync` with an **agent-scoped** API key. The pushed manifest lands as a pending draft for dashboard review — it never changes the live agent. Nothing syncs unless the customer calls these functions explicitly; existing behavior is unchanged.
 
 ## [0.2.9] - 2026-06-03
 
