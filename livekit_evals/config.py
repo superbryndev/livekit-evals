@@ -31,7 +31,7 @@ CREDENTIALS_CONFIG = {
 # Customize these to identify different agents/versions in your webhook data
 
 _DEFAULT_AGENT_ID = "livekit-agent"  # Change to identify your agent
-_DEFAULT_VERSION_ID = "v1"           # Increment when making updates
+_DEFAULT_VERSION_ID = "v1"  # Increment when making updates
 
 AGENT_CONFIG = {
     "id": os.getenv("AGENT_ID", _DEFAULT_AGENT_ID),

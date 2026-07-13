@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "livekit-evals"
-version = "0.2.13"
+version = "0.3.0"
 description = "Track and evaluate LiveKit agent sessions with automatic metrics, transcripts, and usage analytics"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "superbryndev", email = "support@superbryndev.com"}
@@ -18,10 +18,10 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Communications :: Telephony",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
@@ -30,6 +30,12 @@ classifiers = [
 dependencies = [
     "livekit-agents>=0.8.0",
     "aiohttp>=3.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
 ]
 
 [project.urls]
@@ -42,4 +48,31 @@ Issues = "https://github.com/superbryndev/livekit-evals/issues"
 where = ["."]
 include = ["livekit_evals*"]
 exclude = ["tests*", "examples*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+    ".venv",
+    "build",
+    "dist",
+    # Legacy modules intentionally left untouched by the agent-sync work;
+    # they carry pre-existing style debt that is out of scope here.
+    "livekit_evals/recording_manager.py",
+    "livekit_evals/webhook_handler.py",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "B008",   # default arg call — common pattern in handler constructors
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_import.py" = ["F401", "F841"]
 

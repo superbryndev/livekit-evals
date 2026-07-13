@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-13
+
 ### Added
+- Agent config sync (opt-in). New `livekit_evals.config_sync` module with `build_manifest_from_agent(agent, ...)`, `sync_manifest(manifest, ...)`, `sync_config(agent, ...)`, and `async_sync_config(agent, ...)`. Builds a SuperBryn `AgentSyncManifest` from a LiveKit `Agent`/`AgentSession` (reading `agent.llm` / `agent.stt` / `agent.tts` and `agent.instructions`) and pushes it to `POST {BASE_URL}/public-api/v1/agents/me/sync` with an **agent-scoped** API key. The pushed manifest lands as a pending draft for dashboard review — it never changes the live agent. Nothing syncs unless the customer calls these functions explicitly; existing behavior is unchanged.
+- Config-sync extraction now unwraps wrapped pipeline components. `FallbackAdapter`, `StreamAdapter`, and custom wrappers (e.g. sanitising/mixing TTS classes) are descended to the base `livekit.plugins.<provider>` instance via the same cycle-safe walker the webhook handler uses (now shared in `livekit_evals._component_unwrap`), so provider/model/voice blocks are no longer silently dropped for wrapped agents. For `FallbackAdapter`, the first non-primary instance is reported in the manifest's `fallback` sub-block (`llm`/`stt`/`tts`/`voice`).
 - Tool call capture via the LiveKit `function_tools_executed` event. Every tool/function invoked by the agent during a session is now collected and emitted as `payload["call"]["tool_calls"]` — a list of objects with `id`, `function_name`, `arguments` (raw JSON string), `result`, `is_error`, `start_ms`, `end_ms`, and `timestamp_ms`. Timing offsets are derived from `FunctionCall.created_at` and `FunctionCallOutput.created_at` (ms from call start), matching the canonical shape used by VAPI and Retell in the orchestration layer.
+- Test suite (`tests/`) covering manifest extraction (direct, wrapped, fallback), secret non-extraction, override precedence, schema validation, HTTP error handling (blocking and async), and package exports; run in CI via `.github/workflows/test.yml`.
+
+### Fixed
+- TTS voice extraction for the ElevenLabs plugin: the voice is stored under `_opts.voice_id`, which the extractor's candidate paths didn't cover, so the manifest's `tts.voice_id` and the derived top-level `voice` block were silently missing. `_opts.voice_id` / `opts.voice_id` added to the candidate list.
+- Documentation incorrectly claimed extraction reads "public attributes only". Extraction reads a fixed allow-list of configuration attributes that includes private fields (`_opts`, `_model`, `_voice`, ...); credential attributes are never in that list. Docs now say so explicitly.
+
+### Changed
+- Minimum supported Python is now 3.10 (`requires-python >= 3.10`). The previous 3.9 claim was already unachievable — `livekit-agents` itself requires 3.10-only typing features — so installs on 3.9 now fail clearly at dependency resolution instead of at import time.
+
+### Removed
+- Static source scanning (`scan_root=` / `livekit_evals.codescan`), which was briefly on the unreleased branch. Walking a whole project tree and uploading the longest prompt-like string risked syncing unrelated or confidential source content. Sections the runtime can't expose are supplied via explicit keyword overrides instead.
 
 ## [0.2.9] - 2026-06-03
 
@@ -101,7 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secure environment variable handling
 - No sensitive data logged in production
 
-[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/superbryndev/livekit-evals/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/superbryndev/livekit-evals/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/superbryndev/livekit-evals/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/superbryndev/livekit-evals/compare/v0.2.6...v0.2.7

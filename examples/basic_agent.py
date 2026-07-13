@@ -6,6 +6,7 @@ The integration requires just 3 lines of code to track all session metrics.
 """
 
 import logging
+
 from dotenv import load_dotenv
 from livekit.agents import (
     NOT_GIVEN,
@@ -35,7 +36,7 @@ load_dotenv(".env")
 
 class Assistant(Agent):
     """A simple voice AI assistant with weather lookup capability."""
-    
+
     def __init__(self) -> None:
         super().__init__(
             instructions="""You are a helpful voice AI assistant.
@@ -65,7 +66,7 @@ def prewarm(proc: JobProcess):
 
 async def entrypoint(ctx: JobContext):
     """Main entrypoint for the LiveKit agent."""
-    
+
     # Logging setup - add context fields for better debugging
     ctx.log_context_fields = {
         "room": ctx.room.name,
@@ -93,24 +94,20 @@ async def entrypoint(ctx: JobContext):
         # Large Language Model (LLM) - your agent's brain
         # See all providers at https://docs.livekit.io/agents/integrations/llm/
         llm=openai.LLM(model="gpt-4o-mini"),
-        
         # Speech-to-text (STT) - your agent's ears
         # See all providers at https://docs.livekit.io/agents/integrations/stt/
         stt=deepgram.STT(model="nova-3", language="multi"),
-        
         # Text-to-speech (TTS) - your agent's voice
         # See all providers at https://docs.livekit.io/agents/integrations/tts/
         tts=cartesia.TTS(
-            voice='ea8d222e-48d5-465e-aeab-a4ee929d16c6',  # chaithra
+            voice="ea8d222e-48d5-465e-aeab-a4ee929d16c6",  # chaithra
             speed="normal",
             language="hi",
         ),
-        
         # VAD and turn detection - determines when user is speaking
         # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        
         # Allow LLM to generate response while waiting for end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
@@ -169,4 +166,3 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-
