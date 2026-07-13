@@ -12,8 +12,11 @@ SuperBryn dashboard); org-scoped keys are rejected by the endpoint. The
 pushed manifest lands as a pending draft that a human approves in the
 review UI — syncing never changes the live agent directly.
 
-Extractors read public attributes only. API keys and other secrets held by
-LiveKit plugin objects are never read or transmitted.
+Extraction reads a fixed allow-list of configuration attributes on the
+pipeline components — including private fields such as ``_opts``, ``_model``
+and ``_voice`` where LiveKit plugins keep their settings. Credential
+attributes (API keys, tokens, secrets) are never part of that list and are
+never read or transmitted.
 """
 
 from __future__ import annotations
@@ -24,6 +27,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Literal, TypedDict
 
+from ._component_unwrap import (
+    _INNER_ATTRS_BY_ROLE,
+    _fallback_instances,
+    _unwrap_to_base_component,
+)
 from .config import BASE_URL, WEBHOOK_CONFIG
 
 logger = logging.getLogger("superbryn.livekit.sync")
@@ -223,10 +231,8 @@ def _extract_tools_from_agent(agent: Any) -> list[ToolConfig] | None:
     return entries or None
 
 
-def _extract_component(obj: Any, role: str) -> dict[str, Any] | None:
-    """Extract a {provider, model, ...} block from a LiveKit plugin object."""
-    if obj is None:
-        return None
+def _extract_component_fields(obj: Any, role: str) -> dict[str, Any]:
+    """Read {provider, model, ...} fields from a single (unwrapped) plugin object."""
     block: dict[str, Any] = {}
 
     provider = _provider_from_plugin(obj)
@@ -255,6 +261,36 @@ def _extract_component(obj: Any, role: str) -> dict[str, Any] | None:
         if isinstance(voice, str) and voice:
             block["voice_id"] = voice
 
+    return block
+
+
+def _extract_component(obj: Any, role: str) -> dict[str, Any] | None:
+    """Extract a {provider, model, ...} block from a LiveKit component.
+
+    Components are often not the plugin itself but a wrapper —
+    ``FallbackAdapter``, ``StreamAdapter``, or a custom class holding the
+    real plugin in an inner attribute. Those wrappers carry no provider
+    module path and no model/voice attributes, so extraction on the wrapper
+    yields nothing. Unwrap to the base plugin first (cycle-safe), and for
+    ``FallbackAdapter`` report the first non-primary instance in the
+    manifest's ``fallback`` sub-block.
+    """
+    if obj is None:
+        return None
+
+    inner_attrs = _INNER_ATTRS_BY_ROLE[role]
+    base = _unwrap_to_base_component(obj, inner_attrs)
+    block = _extract_component_fields(base if base is not None else obj, role)
+
+    fallbacks = _fallback_instances(obj, inner_attrs)
+    if fallbacks:
+        fallback_base = _unwrap_to_base_component(fallbacks[0], inner_attrs)
+        fallback_block = _extract_component_fields(
+            fallback_base if fallback_base is not None else fallbacks[0], role
+        )
+        if fallback_block:
+            block["fallback"] = fallback_block
+
     return block or None
 
 
@@ -270,22 +306,16 @@ def build_manifest_from_agent(
     policy_guardrails: str | None = None,
     additional_details: str | None = None,
     concurrency_calls: int | None = None,
-    scan_root: str | None = None,
 ) -> dict[str, Any]:
     """Build an AgentSyncManifest dict from a LiveKit Agent / AgentSession.
 
-    Reads ``agent.llm`` / ``agent.stt`` / ``agent.tts`` (public accessors on
-    both ``Agent`` and ``AgentSession``) to fill the top-level pipeline
-    blocks, ``agent.instructions`` as the behavior prompt, and
-    ``agent.tools`` as ``config.tools`` — unless explicit ``behavior`` /
-    ``tools`` overrides are given, which always win. Everything the runtime
-    genuinely can't know (identity, telephony, guardrails, concurrency, ...)
-    is supplied through the keyword overrides — or discovered by a static
-    source scan when ``scan_root`` (a file or project directory) is given.
-    Precedence per section: explicit keyword override > runtime extraction
-    > source scan. See :mod:`livekit_evals.codescan` for what the scan
-    looks for (``agent_name=``, ``phone_number=``,
-    ``POLICY_GUARDRAILS = ...``, ``concurrency_calls=``, ...).
+    Reads ``agent.llm`` / ``agent.stt`` / ``agent.tts`` (accessors on both
+    ``Agent`` and ``AgentSession``) to fill the top-level pipeline blocks,
+    ``agent.instructions`` as the behavior prompt, and ``agent.tools`` as
+    ``config.tools`` — unless explicit ``behavior`` / ``tools`` overrides
+    are given, which always win. Everything the runtime genuinely can't
+    know (identity, telephony, guardrails, concurrency, ...) is supplied
+    through the keyword overrides.
 
     Override shapes mirror the canonical manifest schema exactly (see the
     TypedDicts at the top of this module):
@@ -323,7 +353,7 @@ def build_manifest_from_agent(
 
     tts_block = manifest.get("tts")
     if isinstance(tts_block, dict) and tts_block.get("voice_id"):
-        manifest["voice"] = {
+        voice_block = {
             k: v
             for k, v in (
                 ("provider", tts_block.get("provider")),
@@ -331,37 +361,33 @@ def build_manifest_from_agent(
             )
             if v
         }
+        tts_fallback = tts_block.get("fallback")
+        if isinstance(tts_fallback, dict) and tts_fallback.get("voice_id"):
+            voice_fallback = {
+                k: v
+                for k, v in (
+                    ("provider", tts_fallback.get("provider")),
+                    ("voice_id", tts_fallback["voice_id"]),
+                )
+                if v
+            }
+            if voice_fallback:
+                voice_block["fallback"] = voice_fallback
+        manifest["voice"] = voice_block
 
     if behavior is None:
-        instructions = getattr(agent, "instructions", None)
-        if isinstance(instructions, str) and instructions.strip():
-            behavior = {"prompt": instructions}
+        try:
+            instructions = getattr(agent, "instructions", None)
+            if isinstance(instructions, str) and instructions.strip():
+                behavior = {"prompt": instructions}
+        except Exception as exc:  # noqa: BLE001 — never break the customer's agent
+            logger.debug("instructions extraction failed: %s", exc)
 
     if tools is None:
         try:
             tools = _extract_tools_from_agent(agent)
         except Exception as exc:  # noqa: BLE001 — never break the customer's agent
             logger.debug("tool extraction failed: %s", exc)
-
-    if scan_root is not None:
-        try:
-            from .codescan import scan_source_config
-
-            scanned = scan_source_config(scan_root)
-            if identity is None and "identity" in scanned:
-                identity = scanned["identity"]
-            if behavior is None and "behavior" in scanned:
-                behavior = scanned["behavior"]
-            if telephony is None and "telephony" in scanned:
-                telephony = scanned["telephony"]
-            if policy_guardrails is None and "policy_guardrails" in scanned:
-                policy_guardrails = scanned["policy_guardrails"]
-            if additional_details is None and "additional_details" in scanned:
-                additional_details = scanned["additional_details"]
-            if concurrency_calls is None and "concurrency_calls" in scanned:
-                concurrency_calls = scanned["concurrency_calls"]
-        except Exception as exc:  # noqa: BLE001 — never break the customer's agent
-            logger.debug("source scan failed: %s", exc)
 
     config: dict[str, Any] = {}
     if identity is not None:

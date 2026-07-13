@@ -347,7 +347,7 @@ sync_config(
 )
 ```
 
-The helper reads `agent.llm` / `agent.stt` / `agent.tts` to fill the pipeline blocks, uses `agent.instructions` as the behavior prompt, and maps `agent.tools` (function tools) to `tools` — explicit `behavior=` / `tools=` overrides always win (public attributes only — your provider API keys are never read). The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_agent(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
+The helper reads `agent.llm` / `agent.stt` / `agent.tts` to fill the pipeline blocks (unwrapping `FallbackAdapter` / `StreamAdapter` / custom wrappers to the base plugin, and reporting fallback instances in the manifest's `fallback` sub-blocks), uses `agent.instructions` as the behavior prompt, and maps `agent.tools` (function tools) to `tools` — explicit `behavior=` / `tools=` overrides always win. Extraction reads a fixed allow-list of configuration attributes (including private fields like `_opts`, `_model`, `_voice` where LiveKit plugins store their settings); credential attributes such as provider API keys are never part of that list and are never read or transmitted. The manifest lands as a pending draft in the SuperBryn dashboard for review; it never changes the live agent directly. Use `async_sync_config(...)` inside a running event loop, or `build_manifest_from_agent(...)` + `sync_manifest(...)` to inspect/modify the manifest before pushing.
 
 Override sections accept exactly the fields of the canonical manifest schema (unknown keys raise `ValueError` locally — the endpoint rejects them anyway):
 
@@ -359,9 +359,7 @@ Override sections accept exactly the fields of the canonical manifest schema (un
 | `language` | `primary_language`, `additional_languages: [{code, priority}]` |
 | `telephony` | `phone_number`, `ivr_config: {enabled, number}` |
 
-Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurrency_calls`.
-
-For the sections the agent object can't expose, pass `scan_root="path/to/project"` to statically scan your source for them (`agent_name=`, `phone_number=`, `POLICY_GUARDRAILS = "..."`, `concurrency_calls=`, ...). Precedence per section: explicit kwarg > runtime extraction > source scan. The scan is read-only and best-effort — see `livekit_evals/codescan.py`.
+Plus top-level strings/ints: `policy_guardrails`, `additional_details`, `concurrency_calls`. Sections the agent object can't expose (identity, telephony, guardrails, ...) are supplied through these explicit overrides.
 
 Docs: https://docs.superbryn.com/advanced/agent-sync
 

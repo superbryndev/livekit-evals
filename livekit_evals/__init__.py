@@ -5,7 +5,6 @@ A simple, drop-in package to automatically track metrics, transcripts, and usage
 analytics for your LiveKit voice AI agents.
 """
 
-from .codescan import scan_source_config
 from .config_sync import (
     BehaviorConfig,
     IdentityConfig,
@@ -30,7 +29,6 @@ __all__ = [
     "create_webhook_handler",
     "async_sync_config",
     "build_manifest_from_agent",
-    "scan_source_config",
     "sync_config",
     "sync_manifest",
 ]

@@ -32,6 +32,12 @@ dependencies = [
     "aiohttp>=3.9.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
 [project.urls]
 Homepage = "https://github.com/superbryndev/livekit-evals"
 Documentation = "https://github.com/superbryndev/livekit-evals#readme"
