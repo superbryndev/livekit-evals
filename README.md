@@ -21,6 +21,10 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 - 🔊 **Stereo Recording** - Dual-channel recording with agent on left, caller on right (one param)
 - 🗂️ **Custom Data** - Attach arbitrary JSON to every webhook payload via `custom_data`
 - 🔐 **Secure** - API key authentication; temporary S3 credentials fetched per-session
+- ⏱️ **Turn-Detection Latency** - End-of-utterance (EOU) + transcription delays per turn, the hidden part of response latency
+- 🌐 **Network Telemetry** - Connection quality, reconnects, and WebRTC stats (jitter, RTT, packet loss, audio dropouts)
+- 🚨 **Provider Errors** - Typed STT/LLM/TTS failures with recoverability, model, and provider
+- 🗣️ **Conversation Analytics** - Talk ratio, silence, interruptions, backchannels, DTMF keypresses, full SIP attributes
 
 ## 🚀 Quick Start
 
@@ -225,9 +229,78 @@ VERSION_ID=v1.0.0
 - Egress recording URLs
 - LiveKit Cloud deployment status
 
+### Extended Telemetry (on by default)
+
+Everything below ships as **additive** sections in the same payload — all previously existing
+fields are unchanged. Disable with `extended_capture=False` for the legacy shape.
+Older livekit-agents versions simply produce fewer fields (each capture is
+feature-detected; nothing breaks).
+
+| Section | What's inside |
+|---------|---------------|
+| `call.turn_detection` | Per-turn end-of-utterance delay, transcription delay, end-of-turn model inference stats |
+| `call.latency` (new keys) | `eou_ms`, `transcription_ms`, `e2e_ms` (EOU + LLM TTFT + TTS TTFB — true perceived latency) |
+| `call.speech_stats` | User/agent talk seconds, turn counts, talk ratio, silence, longest gap, response delays |
+| `call.interruptions` | Interrupted agent turns, false interruptions, detected interruptions + backchannels (SDK ≥1.6) |
+| `call.network` | Connection quality timeline, reconnects, disconnect reasons, WebRTC stats polled every 10s (jitter, RTT, packet loss %, concealed samples, NACKs, bytes) |
+| `call.errors` | Typed provider failures (`stt_error`/`llm_error`/`tts_error`), message, `recoverable`, model, provider |
+| `call.close` | LiveKit's own close reason + terminal error (separate from your `call_end_reason`) |
+| `call.sip` | Full `sip.*` attribute snapshot + DTMF keypresses with timestamps |
+| `call.vad` | VAD inference count/latency and idle time |
+| `call.environment` | livekit-agents / livekit / livekit-evals / Python versions, RTC stats support flag |
+| `call.usage` (new keys) | LLM cached prompt tokens + tokens/sec, STT/TTS connection acquire times, realtime-model audio/text/cached token splits |
+
+Example of the extended sections:
+
+```json
+{
+  "call": {
+    "latency": { "llm_ms": 450.5, "stt_ms": 120.3, "tts_ms": 180.7, "total_ms": 751.5,
+                 "eou_ms": 420.0, "transcription_ms": 95.0, "e2e_ms": 1051.2 },
+    "turn_detection": {
+      "avg_eou_delay_ms": 420.0, "max_eou_delay_ms": 610.2, "avg_transcription_delay_ms": 95.0,
+      "eot_inference_count": 14, "avg_eot_prediction_ms": 81.5,
+      "eou_events": [ { "timestamp_ms": 5210, "eou_delay_ms": 402.1, "transcription_delay_ms": 88.0, "on_user_turn_completed_delay_ms": 1.2 } ]
+    },
+    "speech_stats": {
+      "user_talk_seconds": 41.2, "agent_talk_seconds": 88.6, "user_turn_count": 12, "agent_turn_count": 13,
+      "avg_user_turn_seconds": 3.4, "avg_agent_turn_seconds": 6.8, "agent_talk_ratio": 0.683,
+      "silence_seconds": 20.2, "longest_silence_ms": 4100,
+      "avg_response_delay_ms": 910.4, "max_response_delay_ms": 2210.0
+    },
+    "interruptions": { "agent_turns_interrupted": 2, "false_interruptions": 0,
+                       "detected_interruptions": 2, "backchannels": 5, "detection_delay_ms": 150.0 },
+    "network": {
+      "worst_connection_quality": "poor",
+      "connection_quality_events": [ { "timestamp_ms": 61200, "participant": "+12025551234", "quality": "poor" } ],
+      "reconnect_count": 1,
+      "connection_events": [ { "type": "reconnecting", "timestamp_ms": 63400 }, { "type": "reconnected", "timestamp_ms": 64100 } ],
+      "track_subscription_failures": 0,
+      "room_disconnect_reason": "client_initiated",
+      "rtc": {
+        "summary": { "samples_collected": 15, "avg_jitter_ms": 12.0, "max_jitter_ms": 41.5,
+                     "avg_rtt_ms": 70.0, "max_rtt_ms": 180.2, "packets_received": 14200, "packets_lost": 36,
+                     "packet_loss_pct": 0.25, "concealed_samples": 4800, "silent_concealed_samples": 1200,
+                     "nack_count": 6, "bytes_received": 2400000, "bytes_sent": 2300000,
+                     "avg_jitter_buffer_delay_ms": 42.1, "remote_fraction_lost_max": 0.02 },
+        "samples": [ { "t_ms": 10000, "jitter_ms": 9.5, "rtt_ms": 65.0, "packets_lost": 4 } ]
+      }
+    },
+    "errors": [ { "timestamp_ms": 84200, "error_type": "stt_error", "message": "deepgram websocket closed: 1011",
+                  "recoverable": true, "label": "deepgram.STT", "source_model": "nova-3", "source_provider": "deepgram" } ],
+    "close": { "reason": "participant_disconnected", "error_type": null, "error_message": null },
+    "sip": { "attributes": { "sip.callID": "abc-123", "sip.callStatus": "hangup", "sip.phoneNumber": "+12025551234" },
+             "dtmf": [ { "timestamp_ms": 32000, "digit": "1", "code": 1 } ] },
+    "vad": { "inference_count": 4210, "avg_inference_ms": 1.9, "total_inference_seconds": 8.1, "idle_time_seconds": 3.2 },
+    "environment": { "livekit_evals_version": "0.2.14", "livekit_agents_version": "1.6.5",
+                     "livekit_rtc_version": "1.1.13", "python_version": "3.12.12", "rtc_stats_supported": true }
+  }
+}
+```
+
 ## 🔍 How It Works
 
-1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `conversation_item_added`) and to the per-plugin `metrics_collected` events on STT/LLM/TTS (the non-deprecated metrics surface), with `session_usage_updated` as a fallback for realtime models
+1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `conversation_item_added`) and to the per-plugin `metrics_collected` events on STT/LLM/TTS (the non-deprecated metrics surface), with `session_usage_updated` as a fallback for realtime models. With extended capture (default) it also listens to the session `error` / `agent_false_interruption` events, the session-level `metrics_collected` re-emit (the only surface carrying VAD/EOU/interruption metrics — a one-line deprecation warning in logs is expected), room events (`connection_quality_changed`, `reconnecting`/`reconnected`, `sip_dtmf_received`, `participant_attributes_changed`, ...), and polls `room.get_rtc_stats()` every 10s
 2. **Data Aggregation:** Collects and processes events during the session
 3. **Auto-Detection:** Extracts configuration from session objects
 4. **Webhook Delivery:** Sends comprehensive payload to webhook endpoint when session ends
@@ -331,6 +404,21 @@ VERSION_ID=v1.0.0
 ```
 
 ## 🛠️ Advanced Usage
+
+### Disabling Extended Capture
+
+Extended telemetry (turn detection, network stats, errors, SIP detail, ...) is
+on by default and adds no meaningful overhead — network stats are polled once
+every 10 seconds and everything else is passive event listening. To emit the
+exact legacy payload instead:
+
+```python
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    extended_capture=False,  # legacy payload shape only
+)
+```
 
 ### Custom Data
 
