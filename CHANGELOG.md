@@ -8,7 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Extended capture** (`extended_capture=True`, on by default): the handler now extracts the maximum telemetry the LiveKit SDK exposes and emits it as **additive** sections in the webhook payload. All existing fields are unchanged; consumers that don't know the new keys are unaffected. Set `extended_capture=False` for the exact legacy payload.
+  - `call.turn_detection` — end-of-utterance (EOU) latency per user turn (`eou_events`, capped at 200) plus `avg/max_eou_delay_ms`, `avg_transcription_delay_ms`, and end-of-turn model inference stats. This is the previously-invisible chunk of perceived response latency.
+  - `call.latency` gains `eou_ms`, `transcription_ms`, and `e2e_ms` (EOU + LLM TTFT + TTS TTFB) when EOU metrics were observed. Existing `llm_ms`/`stt_ms`/`tts_ms`/`total_ms` computed exactly as before.
+  - `call.speech_stats` — user/agent talk seconds and turn counts, average turn lengths, agent talk ratio, approximate silence seconds, `longest_silence_ms`, avg/max response delay. Derived from the turn timings already captured; no new listeners.
+  - `call.interruptions` — `agent_turns_interrupted` (derived), `false_interruptions` (agent paused for a non-interruption), and on SDKs ≥1.6 `detected_interruptions`, `backchannels`, `detection_delay_ms` from `InterruptionMetrics`.
+  - `call.network` — per-participant `connection_quality_events` + `worst_connection_quality`, reconnect/disconnect events with reasons (incl. SIP-specific ones), `track_subscription_failures`, and a `rtc` block polled every 10s via `room.get_rtc_stats()`: jitter, RTT, packet loss %, concealed samples (audio dropouts), NACKs, jitter-buffer delay, bytes in/out — summary plus a bounded timeline (≤90 samples).
+  - `call.errors` — typed provider failures from the session `error` event (`stt_error`/`llm_error`/`tts_error`/realtime), with message (truncated to 500 chars), `recoverable` flag, source model + provider. Capped at 50.
+  - `call.close` — LiveKit's own close `reason` + terminal error, kept separate from the app-controlled `call_end_reason`.
+  - `call.sip` — full `sip.*` participant attribute snapshot (callID, callStatus, trunk IDs, ...) and DTMF keypresses with timestamps (≤100).
+  - `call.vad` — VAD inference count, avg inference ms, total inference seconds, idle time.
+  - `call.environment` — livekit-agents / livekit / livekit-evals / Python versions and whether RTC stats were supported, so per-version capture gaps are auditable server-side.
+  - `call.usage` gains `llm_prompt_cached_tokens`, `llm_tokens_per_second`, STT/TTS `*_avg_acquire_time_ms` (connection-pool health, SDK ≥1.6), and realtime-model token splits (`realtime_input_text/audio/cached_tokens`, `realtime_output_text/audio_tokens`).
+- Version tolerance: extended metric types are matched by their `type` discriminator (no imports that break on older SDKs), each listener subscription is individually feature-detected, and `get_rtc_stats` is probed with `hasattr`. Verified against livekit-agents 1.4.2 and 1.6.5 — older SDKs simply produce fewer fields.
+- Fail-soft guarantees: every extended section builder is exception-isolated (a broken section becomes `null` instead of dropping the webhook), all event lists are bounded, and the extended payload is JSON-sanitized before POST.
 - Tool call capture via the LiveKit `function_tools_executed` event. Every tool/function invoked by the agent during a session is now collected and emitted as `payload["call"]["tool_calls"]` — a list of objects with `id`, `function_name`, `arguments` (raw JSON string), `result`, `is_error`, `start_ms`, `end_ms`, and `timestamp_ms`. Timing offsets are derived from `FunctionCall.created_at` and `FunctionCallOutput.created_at` (ms from call start), matching the canonical shape used by VAPI and Retell in the orchestration layer.
+
+### Notes
+- Extended capture subscribes to the session-level `metrics_collected` event (deprecated upstream but still emitted) because it is the only surface carrying VAD/EOU/EOT/interruption metrics; provider metrics arriving there are de-duplicated against the per-plugin path. A one-line deprecation warning in agent logs is expected.
 
 ## [0.2.9] - 2026-06-03
 
