@@ -35,7 +35,7 @@ Automatically capture transcripts, usage metrics, latency data, and session anal
 ### Installation
 
 ```bash
-pip install livekit-evals
+pip install -U "livekit-evals>=0.3.0"
 ```
 
 ### Integration (3 Lines)
@@ -566,6 +566,42 @@ the call is ending. For example:
 - your app triggers a transfer to a human
 - you enforce a silence timeout or no-answer timeout
 - you intentionally delete the room during graceful shutdown
+
+## 🧪 Testing data (eval mode)
+
+When SuperBryn tests your agent, eval mode sends your agent's own record of each test call to SuperBryn, so you can see it next to the test: its transcript and tool calls, the latency of each reply (transcript, end of turn, first LLM token, first TTS audio, end to end), its models, turn-taking and interruption settings, tools, token and audio usage, every LLM request with what became of its answer (spoken, cut off, not spoken, stopped or only a tool call), and every STT, LLM or TTS failure. It runs only for SuperBryn test calls, in the background: it adds no latency and records no audio. Every other call sends nothing about the call. To spot phone tests, a SIP call without a test ID checks SuperBryn's caller numbers; they are cached for an hour in a file in the temp dir that every job on the host shares (a failed fetch is retried after a minute).
+
+It needs livekit-evals 0.3.0 or later:
+
+```bash
+pip install -U "livekit-evals>=0.3.0"
+```
+
+Add two lines to your entrypoint, once per job, before `session.start()`:
+
+```python
+from livekit_evals import attach_test_data
+
+async def entrypoint(ctx: JobContext):
+    session = AgentSession(...)
+    attach_test_data(ctx, session)
+    await session.start(agent=YourAgent(), room=ctx.room)
+```
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SUPERBRYN_TEST_API_KEY` | ✅ Yes | Organization API key with the `test_data:write` scope. Falls back to `SUPERBRYN_API_KEY` |
+| `SUPERBRYN_AGENT_ID` | ✅ Yes | Your SuperBryn agent ID (a UUID); without it nothing is sent. Leaves `AGENT_ID`, which Observability uses, untouched |
+| `SUPERBRYN_BASE_URL` | ⚪ Optional | Defaults to `https://api.superbryn.com` |
+
+`attach_test_data` also takes `api_key=`, `agent_id=` and `base_url=`.
+
+How a test call is recognised:
+- **Phone tests** need nothing more. They are matched by the number SuperBryn calls from.
+- **SIP endpoint tests** carry an `X-SuperBryn-Call-Id` header. Set your inbound trunk's `include_headers` to X headers (`SIP_X_HEADERS`), or map `X-SuperBryn-Call-Id` with `headers_to_attributes` to an attribute named `superbryn_call_id` (any name ending in `superbryn_call_id` or `x-superbryn-call-id` works; other names are not read).
+- **Webhook and Custom cURL triggers**: copy `superbryn_call_id` from SuperBryn's trigger request into the job (dispatch) or room metadata as `{"superbryn_call_id": "..."}`.
+
+Its info, warning and error log lines (logger `test_data`) start with `SUPERBRYN_TEST_DATA_`: `SUPERBRYN_TEST_DATA_SENT` when SuperBryn accepted an event, `SUPERBRYN_TEST_DATA_DISABLED` when the API key or agent ID is missing, `SUPERBRYN_TEST_DATA_RETRY`, `SUPERBRYN_TEST_DATA_REJECTED` and `SUPERBRYN_TEST_DATA_FAILED` for delivery problems, and `SUPERBRYN_TEST_DATA_ERROR` for anything else. None of them affects the call.
 
 ## 🐛 Troubleshooting
 

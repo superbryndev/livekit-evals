@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - Unreleased
+
+### Added
+- Eval mode: `attach_test_data(ctx, session)`, called once per job before `session.start()`, sends the agent's own record of each SuperBryn test call to SuperBryn: `call.started` when the call is recognised, then `call.ended` with the transcript (LiveKit's expressive `<expr/>` markup removed from agent text), tool calls, per-reply latencies, the models that ran (the current agent's own STT/LLM/TTS over the session's, adapters and fallback lists unwrapped), turn detection and interruption settings as LiveKit resolved them, the tools offered (MCP toolsets included), token, audio and character usage, every LLM request (realtime responses included) with its start, its tokens and what became of its answer: spoken, cut off, not spoken, stopped or only a tool call, and every STT, LLM or TTS failure with whether LiveKit's retry saved it. The requests are read from the session's recorded events when the call ends, so nothing subscribes to the deprecated `metrics_collected`. No audio is sent.
+- A test call is recognised by `superbryn_call_id` in the job or room metadata, by the `X-SuperBryn-Call-Id` SIP header (an attribute ending in `x-superbryn-call-id` or `superbryn_call_id`), or by SuperBryn's caller number. The caller numbers are cached for an hour in a file in the temp dir that every job on the host shares.
+- Settings: `SUPERBRYN_TEST_API_KEY` (falls back to `SUPERBRYN_API_KEY`), `SUPERBRYN_AGENT_ID` (required) and `SUPERBRYN_BASE_URL`, or `api_key=`, `agent_id=` and `base_url=`. Its info, warning and error log lines start with `SUPERBRYN_TEST_DATA_`.
+- Built for production agents: it runs in a background task and one shutdown callback, never raises into the agent, sends strict JSON (a section that can't be sent is left out alone), and finishes its shutdown work within 8 s (LiveKit stops a job's process 10 s into its shutdown).
+
+## [0.2.12] - 2026-06-18
 
 ### Added
 - Tool call capture via the LiveKit `function_tools_executed` event. Every tool/function invoked by the agent during a session is now collected and emitted as `payload["call"]["tool_calls"]` — a list of objects with `id`, `function_name`, `arguments` (raw JSON string), `result`, `is_error`, `start_ms`, `end_ms`, and `timestamp_ms`. Timing offsets are derived from `FunctionCall.created_at` and `FunctionCallOutput.created_at` (ms from call start), matching the canonical shape used by VAPI and Retell in the orchestration layer.
