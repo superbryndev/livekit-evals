@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Prompt sync.** `create_webhook_handler(prompt=..., prompt_version=..., first_message=..., prompt_tools=...)`: each call carries `metadata.prompt_ref` (`sha256` of the template plus your label) and the template is pushed once per process per version to `POST /public-api/v1/prompts` (needs the `obs:write` scope; fails open). The push goes to `SUPERBRYN_BASE_URL`, else the webhook URL's host. `prompt_ref` / `prompt_hash` / `push_prompt` are exported.
 - **Extended capture** (`extended_capture=True`, on by default): the handler now extracts the maximum telemetry the LiveKit SDK exposes and emits it as **additive** sections in the webhook payload. All existing fields are unchanged; consumers that don't know the new keys are unaffected. Set `extended_capture=False` for the exact legacy payload.
   - `call.turn_detection` — end-of-utterance (EOU) latency per user turn (`eou_events`, capped at 200) plus `avg/max_eou_delay_ms`, `avg_transcription_delay_ms`, and end-of-turn model inference stats. This is the previously-invisible chunk of perceived response latency.
   - `call.latency` gains `eou_ms`, `transcription_ms`, and `e2e_ms` (EOU + LLM TTFT + TTS TTFB) when EOU metrics were observed. Existing `llm_ms`/`stt_ms`/`tts_ms`/`total_ms` computed exactly as before.
