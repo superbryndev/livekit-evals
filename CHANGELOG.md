@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-01
+
 ### Added
 - **Prompt sync.** `create_webhook_handler(prompt=..., prompt_version=..., first_message=..., prompt_tools=...)`: each call carries `metadata.prompt_ref` (`sha256` of the template plus your label) and the template is pushed once per process per version to `POST /public-api/v1/prompts` (needs the `obs:write` scope; fails open). The push goes to `SUPERBRYN_BASE_URL`, else the webhook URL's host. `prompt_ref` / `prompt_hash` / `push_prompt` are exported.
+
+## [0.2.14] - 2026-09-28
+
+### Added
 - **Extended capture** (`extended_capture=True`, on by default): the handler now extracts the maximum telemetry the LiveKit SDK exposes and emits it as **additive** sections in the webhook payload. All existing fields are unchanged; consumers that don't know the new keys are unaffected. Set `extended_capture=False` for the exact legacy payload.
   - `call.turn_detection` — end-of-utterance (EOU) latency per user turn (`eou_events`, capped at 200) plus `avg/max_eou_delay_ms`, `avg_transcription_delay_ms`, and end-of-turn model inference stats. This is the previously-invisible chunk of perceived response latency.
   - `call.latency` gains `eou_ms`, `transcription_ms`, and `e2e_ms` (EOU + LLM TTFT + TTS TTFB) when EOU metrics were observed. Existing `llm_ms`/`stt_ms`/`tts_ms`/`total_ms` computed exactly as before.
@@ -23,10 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `call.usage` gains `llm_prompt_cached_tokens`, `llm_tokens_per_second`, STT/TTS `*_avg_acquire_time_ms` (connection-pool health, SDK ≥1.6), and realtime-model token splits (`realtime_input_text/audio/cached_tokens`, `realtime_output_text/audio_tokens`).
 - Version tolerance: extended metric types are matched by their `type` discriminator (no imports that break on older SDKs), each listener subscription is individually feature-detected, and `get_rtc_stats` is probed with `hasattr`. Verified against livekit-agents 1.4.2 and 1.6.5 — older SDKs simply produce fewer fields.
 - Fail-soft guarantees: every extended section builder is exception-isolated (a broken section becomes `null` instead of dropping the webhook), all event lists are bounded, and the extended payload is JSON-sanitized before POST.
-- Tool call capture via the LiveKit `function_tools_executed` event. Every tool/function invoked by the agent during a session is now collected and emitted as `payload["call"]["tool_calls"]` — a list of objects with `id`, `function_name`, `arguments` (raw JSON string), `result`, `is_error`, `start_ms`, `end_ms`, and `timestamp_ms`. Timing offsets are derived from `FunctionCall.created_at` and `FunctionCallOutput.created_at` (ms from call start), matching the canonical shape used by VAPI and Retell in the orchestration layer.
 
 ### Notes
 - Extended capture subscribes to the session-level `metrics_collected` event (deprecated upstream but still emitted) because it is the only surface carrying VAD/EOU/EOT/interruption metrics; provider metrics arriving there are de-duplicated against the per-plugin path. A one-line deprecation warning in agent logs is expected.
+
+## [0.2.13] - 2026-07-07
+
+### Added
+- Bring your own egress: `disable_recording=True` skips SuperBryn's recording, and `set_external_recording_url()` sends your own recording's URL (any time before the webhook fires).
+- Agent handoffs: `AgentHandoff` items in the conversation stream are recorded instead of being treated as messages.
+
+### Changed
+- `agent_id`, `version_id` and the phone number are no longer read from job metadata; pass them explicitly (defaults `livekit-agent`, `v1`).
+
+### Fixed
+- Metrics collection updated to the current LiveKit metrics API.
+
+## [0.2.12] - 2026-06-18
+
+### Added
+- Tool call capture via the LiveKit `function_tools_executed` event. Every tool/function invoked by the agent during a session is now collected and emitted as `payload["call"]["tool_calls"]` — a list of objects with `id`, `function_name`, `arguments` (raw JSON string), `result`, `is_error`, `start_ms`, `end_ms`, and `timestamp_ms`. Timing offsets are derived from `FunctionCall.created_at` and `FunctionCallOutput.created_at` (ms from call start), matching the canonical shape used by VAPI and Retell in the orchestration layer.
 
 ## [0.2.9] - 2026-06-03
 
@@ -119,7 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secure environment variable handling
 - No sensitive data logged in production
 
-[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/superbryndev/livekit-evals/compare/v0.2.14...v0.3.0
+[0.2.14]: https://github.com/superbryndev/livekit-evals/compare/v0.2.13...v0.2.14
+[0.2.13]: https://github.com/superbryndev/livekit-evals/compare/v0.2.12...v0.2.13
+[0.2.12]: https://github.com/superbryndev/livekit-evals/compare/v0.2.9...v0.2.12
 [0.2.9]: https://github.com/superbryndev/livekit-evals/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/superbryndev/livekit-evals/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/superbryndev/livekit-evals/compare/v0.2.6...v0.2.7
