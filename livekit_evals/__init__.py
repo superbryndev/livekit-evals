@@ -5,8 +5,9 @@ A simple, drop-in package to automatically track metrics, transcripts, and usage
 analytics for your LiveKit voice AI agents.
 """
 
+from .prompt_sync import prompt_hash, prompt_ref, push_prompt
 from .webhook_handler import WebhookHandler, create_webhook_handler
 
 __version__ = "0.2.14"
-__all__ = ["WebhookHandler", "create_webhook_handler"]
+__all__ = ["WebhookHandler", "create_webhook_handler", "prompt_hash", "prompt_ref", "push_prompt"]
 

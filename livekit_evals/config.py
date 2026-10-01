@@ -7,6 +7,7 @@ the SUPERBRYN_API_KEY -- no S3 keys are stored in this package.
 """
 
 import os
+from urllib.parse import urlsplit
 
 # =============================================================================
 # Base URL
@@ -56,3 +57,13 @@ WEBHOOK_CONFIG = {
     "url": os.getenv("WEBHOOK_URL", f"{BASE_URL}/webhooks/obs/livekit"),
     "api_key": os.getenv("SUPERBRYN_API_KEY", _DEFAULT_WEBHOOK_API_KEY),
 }
+
+
+def _origin(url: str) -> str:
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+
+
+# Where prompt versions are pushed: SUPERBRYN_BASE_URL when set, else the webhook's host,
+# so pointing WEBHOOK_URL at another environment moves prompt sync with it.
+API_BASE_URL = os.getenv("SUPERBRYN_BASE_URL") or _origin(WEBHOOK_CONFIG["url"]) or BASE_URL
