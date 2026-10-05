@@ -289,6 +289,16 @@ async def test_sip_header_attribute_test_id(http, key):
     assert started.body["agent_id"] == AGENT_UUID
 
 
+async def test_a_trunk_number_given_as_digits_only_is_sent_with_its_plus(http):
+    room = FakeRoom([sip_participant(trunk=THEIR_NUMBER.lstrip("+"), superbryn_call_id="sbc_hdr")])
+    ctx = FakeCtx(room)
+    attach_test_data(ctx, session_with(), api_key="key_1", base_url=BASE)
+
+    assert await recognised(ctx) is True
+    [started] = http.posts("call.started")
+    assert (started.body["from"], started.body["to"]) == (OUR_NUMBER, THEIR_NUMBER)
+
+
 async def test_candidate_confirmed_by_server_sends_both_events(http):
     ctx = FakeCtx(FakeRoom([sip_participant(phone="+1 (415) 555-0100")]))  # formatting differs from ours
     attach_test_data(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
@@ -846,6 +856,23 @@ async def test_each_llm_request_gets_what_became_of_its_answer(http):
     ]
     # one clock for the transcript and the requests
     assert [turn["start_ms"] for turn in body["transcript"]] == [0, 2000, 4700]
+
+
+async def test_a_request_the_llm_failed_on_is_stopped_whatever_its_first_token_time(http):
+    hello = chat("assistant", "Hello, how can I help?", 3.6)
+    session = FakeSession(chat("user", "Hi", 0.0), hello)
+    session._recorded_events = [
+        speech_event("sp2", hello),
+        llm_event(1.0, 3.0, "sp1", ttft=0.4),  # no output: the gateway refused it
+        error_event("llm_error", 3.0, "429 quota exceeded", True, "livekit.LLM"),
+        llm_event(3.1, 3.5, "sp2", prompt=900, completion=10),  # the retry, heard
+    ]
+    body = await ended_body(http, session)
+
+    assert body["diagnostics"]["llm_requests"] == [
+        {"start_ms": 1000, "outcome": "stopped"},
+        {"start_ms": 3100, "outcome": "spoken", "input_tokens": 900, "cached_input_tokens": 0, "output_tokens": 10},
+    ]
 
 
 async def test_realtime_responses_own_the_replies_that_start_after_them(http):

@@ -58,6 +58,8 @@ _MAX_NAME = 200
 _MAX_DESCRIPTION = 4000
 _MAX_LLM_REQUESTS = 2000
 _MAX_ERRORS = 500
+# An LLM error this long after a request's metrics were stamped still belongs to it.
+_FAILURE_SLACK_S = 1.0
 _MAX_ERROR_MESSAGE = 1000
 # LiveKit's error types by pipeline step; a realtime model is the LLM step
 _ERROR_STEPS = {"stt_error": "stt", "llm_error": "llm", "tts_error": "tts", "realtime_model_error": "llm"}
@@ -169,7 +171,7 @@ class _TestCall:
         sip = await _wait_for_sip_participant(self.ctx.room)
         attributes = dict(getattr(sip, "attributes", None) or {})
         self.test_id = _test_id(self.ctx, attributes)
-        remote = attributes.get("sip.phoneNumber") or None
+        remote = _e164(attributes.get("sip.phoneNumber") or None)
         if not self.test_id and not await _is_caller_number(remote, self.base_url, self.api_key):
             logger.debug("not a SuperBryn test call, nothing is sent")
             return
@@ -178,7 +180,7 @@ class _TestCall:
         if not self.call_id:
             logger.warning("SUPERBRYN_TEST_DATA_ERROR: no room SID or name, nothing is sent")
             return
-        trunk = attributes.get("sip.trunkPhoneNumber") or None
+        trunk = _e164(attributes.get("sip.trunkPhoneNumber") or None)
         inbound = bool(attributes.get("sip.ruleID"))  # a dispatch rule matched: we called their agent
         self.started_ts = time.time()
         self.start_fields = _compact({
@@ -434,6 +436,11 @@ def _remember_numbers(base_url: str, numbers: list[str], age: float = 0.0) -> No
         if tmp:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
+
+
+def _e164(number: Optional[str]) -> Optional[str]:
+    """A phone number with its +: LiveKit can give the trunk number as digits only."""
+    return f"+{number}" if number and re.fullmatch(r"\d{8,15}", number) else number
 
 
 def _same_number(a: Optional[str], b: Optional[str]) -> bool:
@@ -766,6 +773,7 @@ def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[A
         upcoming[pool_key(metrics)] = start
     ends.reverse()
 
+    llm_failures = [at for at, step, _ in _reported_errors(events) if step == "llm"]
     claimed: set[Any] = set()
     requests = []
     for (start, metrics), end in list(zip(log, ends))[:_MAX_LLM_REQUESTS]:
@@ -777,20 +785,22 @@ def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[A
         reply = next((item for item in owned if _attr(item, "type") == "message"
                       and _attr(item, "role") == "assistant"), None)
         ttft = _attr(metrics, "ttft")
+        usage = _request_tokens(metrics, key == "realtime")
         if reply is not None:
             outcome = "cut_off" if _attr(reply, "interrupted") else "spoken"
         elif any(_attr(item, "type") == "function_call" for item in owned):
             outcome = "tool_call"
         else:
-            outcome = "not_spoken" if _is_num(ttft) and ttft >= 0 else "stopped"
-        requests.append({"start_ms": max(0, int(round((start - base) * 1000))), "outcome": outcome,
-                         **_request_tokens(metrics, key == "realtime")})
+            # The LLM failed on it (no output, an LLM error while it ran): it never answered, whatever its ttft.
+            failed = not usage and any(start <= at <= _attr(metrics, "timestamp") + _FAILURE_SLACK_S
+                                       for at in llm_failures)
+            outcome = "not_spoken" if _is_num(ttft) and ttft >= 0 and not failed else "stopped"
+        requests.append({"start_ms": max(0, int(round((start - base) * 1000))), "outcome": outcome, **usage})
     return requests
 
 
-def _errors(events: list[Any], base: float) -> list[dict[str, Any]]:
-    """Each STT, LLM or TTS failure the session reported. LiveKit retries a recoverable one, so it recovered unless
-    that step later failed for good; LiveKit's STT hears the caller."""
+def _reported_errors(events: list[Any]) -> list[tuple[float, str, Any]]:
+    """The STT, LLM and TTS failures the session reported, oldest first, each with when it happened."""
     found = []
     for event in events:
         error = _attr(event, "error") if _attr(event, "type") == "error" else None
@@ -798,7 +808,13 @@ def _errors(events: list[Any], base: float) -> list[dict[str, Any]]:
         at = next((t for t in (_attr(error, "timestamp"), _attr(event, "created_at")) if _is_num(t) and t > 0), None)
         if step is not None and at is not None:
             found.append((at, step, error))
-    found.sort(key=lambda entry: entry[0])
+    return sorted(found, key=lambda entry: entry[0])
+
+
+def _errors(events: list[Any], base: float) -> list[dict[str, Any]]:
+    """Each STT, LLM or TTS failure the session reported. LiveKit retries a recoverable one, so it recovered unless
+    that step later failed for good; LiveKit's STT hears the caller."""
+    found = _reported_errors(events)
     gave_up: dict[str, float] = {}  # step -> its last unrecoverable failure
     for at, step, error in found:
         if _attr(error, "recoverable") is False:
