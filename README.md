@@ -292,7 +292,7 @@ Example of the extended sections:
     "sip": { "attributes": { "sip.callID": "abc-123", "sip.callStatus": "hangup", "sip.phoneNumber": "+12025551234" },
              "dtmf": [ { "timestamp_ms": 32000, "digit": "1", "code": 1 } ] },
     "vad": { "inference_count": 4210, "avg_inference_ms": 1.9, "total_inference_seconds": 8.1, "idle_time_seconds": 3.2 },
-    "environment": { "livekit_evals_version": "0.2.14", "livekit_agents_version": "1.6.5",
+    "environment": { "livekit_evals_version": "0.3.0", "livekit_agents_version": "1.6.5",
                      "livekit_rtc_version": "1.1.13", "python_version": "3.12.12", "rtc_stats_supported": true }
   }
 }

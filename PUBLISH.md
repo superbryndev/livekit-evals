@@ -1,227 +1,48 @@
 # Publishing to PyPI
 
-## 🤖 Automatic Publishing (Default)
+The package publishes to PyPI from `.github/workflows/publish.yml` when a change reaches `main`.
 
-The package **automatically publishes to PyPI** when you push to `main`. Version numbers are auto-incremented.
+**The version in `pyproject.toml` is the single source of truth.** CI never bumps it. On every push to `main` that touches the package, CI publishes the declared version if it is not on PyPI yet, and skips the upload if it already is. `main` is protected, so CI cannot push a bump commit back; the bump goes in your PR.
 
-### One-Time Setup
+## How to release
 
-#### 1. Create PyPI Account
-- Go to: https://pypi.org/account/register/
-- Complete registration
-
-#### 2. Generate PyPI API Token
-- Go to: https://pypi.org/manage/account/token/
-- Click "Add API token"
-- Token name: `livekit-evals-github`
-- Scope: "Entire account"
-- Click "Create token"
-- **Copy the token** (starts with `pypi-...`)
-
-#### 3. Add Token to GitHub Secrets
-- Go to GitHub repo → **Settings** → **Secrets and variables** → **Actions**
-- Click "**New repository secret**"
-- Name: `PYPI_API_TOKEN`
-- Value: Paste your PyPI token
-- Click "**Add secret**"
-
-### How to Publish
-
-Just push your changes to `main` with the right commit message:
+In your PR:
 
 ```bash
-git add .
-
-# For bug fixes (patch: 0.1.0 → 0.1.1)
-git commit -m "Fix transcript filtering bug"
-
-# For new features (minor: 0.1.0 → 0.2.0)
-git commit -m "feat: Add custom webhook URL support"
-# OR
-git commit -m "[minor] Add new feature"
-
-# For breaking changes (major: 0.1.0 → 1.0.0)
-git commit -m "[major] Complete API redesign"
-# OR
-git commit -m "BREAKING CHANGE: Rename all functions"
-
-git push origin main
-```
-
-**That's it!** The workflow will:
-1. ✅ Read your commit message
-2. ✅ Auto-increment version appropriately
-3. ✅ Build the package
-4. ✅ Publish to PyPI
-5. ✅ Commit the version bump back to repo
-
-Check the **Actions** tab in GitHub to watch it publish.
-
-### Version Bump Keywords
-
-The workflow detects version bump type from your commit message:
-
-| Keywords | Bump Type | Example | Result |
-|----------|-----------|---------|--------|
-| `feat:` or `[minor]` | **Minor** | `feat: Add retry logic` | 0.1.0 → 0.2.0 |
-| `[major]` or `BREAKING CHANGE` | **Major** | `[major] Remove old API` | 0.2.0 → 1.0.0 |
-| (default) | **Patch** | `Fix bug in webhook` | 0.1.1 → 0.1.2 |
-
-**Examples:**
-```bash
-# Patch (bug fix) - DEFAULT
-git commit -m "Fix filtering empty turns"
-# → 0.1.0 → 0.1.1
-
-# Minor (new feature)
-git commit -m "feat: Add SIP trunk detection"
-# → 0.1.1 → 0.2.0
-
-# Major (breaking change)
-git commit -m "[major] Rename create_handler to create_webhook_handler"
-# → 0.2.0 → 1.0.0
-```
-
-### Monitoring
-
-- **GitHub Actions**: Repo → Actions tab → "Publish to PyPI" workflow
-- **PyPI Page**: https://pypi.org/project/livekit-evals/
-- **Verify Install**: `pip install --upgrade livekit-evals`
-
----
-
-## 🔧 Manual Publishing (Alternative)
-
-If you prefer manual control:
-
-### 1. Install Tools
-
-```bash
-pip install build twine bump2version
-```
-
-### 2. Bump Version
-
-```bash
-# Patch (0.1.0 → 0.1.1) - bug fixes
-bump2version patch
-
-# Minor (0.1.0 → 0.2.0) - new features
-bump2version minor
-
-# Major (0.1.0 → 1.0.0) - breaking changes
-bump2version major
-```
-
-### 3. Build and Upload
-
-```bash
-# Clean old builds
-rm -rf dist/ build/ *.egg-info
-
-# Build
-python -m build
-
-# Upload to PyPI
-twine upload dist/*
-```
-
-### 4. Push Version Bump
-
-```bash
-git push origin main
-```
-
----
-
-## 🐛 Troubleshooting
-
-### "Invalid or non-existent authentication"
-- Check `PYPI_API_TOKEN` secret is set in GitHub
-- Token may have expired - regenerate it
-- Make sure token has correct permissions
-
-### "File already exists"
-- Version already published to PyPI
-- Version number wasn't incremented
-- Check that auto-bump worked (see Actions logs)
-
-### Workflow Doesn't Trigger
-- Only triggers on `main` branch pushes
-- Only when these files change:
-  - `livekit_evals/**`
-  - `pyproject.toml`
-  - `MANIFEST.in`
-- Check Actions tab for errors
-
-### Manual Bump Not Working
-```bash
-# Install bump2version
 pip install bump2version
 
-# Check current version
-grep version pyproject.toml
-
-# Bump version
-bump2version patch
+# pick one: keeps pyproject.toml, livekit_evals/__init__.py and .bumpversion.cfg in lockstep
+bump2version patch   # bug fixes:        0.3.0 -> 0.3.1
+bump2version minor   # new features:     0.3.0 -> 0.4.0
+bump2version major   # breaking changes: 0.3.0 -> 1.0.0
 ```
 
----
+Then add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` and merge to `main`.
 
-## 📋 Publishing Checklist
+CI then:
+1. Checks `pyproject.toml` and `livekit_evals/__init__.py` declare the same version.
+2. Skips the run if that version is already on PyPI.
+3. Fails if `CHANGELOG.md` has no `## [X.Y.Z]` section.
+4. Builds, runs `twine check`, and uploads.
 
-- [ ] Make your code changes
-- [ ] Update `CHANGELOG.md` with changes
-- [ ] Test locally: `pip install -e .`
-- [ ] Commit: `git commit -m "Description"`
-- [ ] Push to main: `git push origin main`
-- [ ] Watch GitHub Actions (Actions tab)
-- [ ] Verify on PyPI: https://pypi.org/project/livekit-evals/
-- [ ] Test install: `pip install --upgrade livekit-evals`
+A PR that changes code but not the version publishes nothing. Re-run a release by hand from Actions → "Publish to PyPI" → Run workflow.
 
----
+## One-time setup
 
-## 🎯 Quick Reference
+1. Create a PyPI API token at https://pypi.org/manage/account/token/ scoped to `livekit-evals`.
+2. In GitHub: Settings → Secrets and variables → Actions → New repository secret. Name `PYPI_API_TOKEN`, value the token.
 
-### Patch Release (Bug Fixes) - DEFAULT
-```bash
-git add .
-git commit -m "Fix bug description"
-git push origin main
-# → Bumps: 0.1.0 → 0.1.1
-```
+## Troubleshooting
 
-### Minor Release (New Features)
-```bash
-git add .
-git commit -m "feat: Add new feature"
-# OR: git commit -m "[minor] Add new feature"
-git push origin main
-# → Bumps: 0.1.0 → 0.2.0
-```
+| Symptom | Cause |
+|---|---|
+| Run says "already published, nothing to do" | You did not bump the version in the PR. |
+| `pyproject.toml (X) and livekit_evals/__init__.py (Y) disagree` | Bumped one file by hand. Use `bump2version`. |
+| `CHANGELOG.md has no '## [X.Y.Z]' section` | Add the section and push again. |
+| `Invalid or non-existent authentication` | `PYPI_API_TOKEN` is missing or expired. |
+| Workflow did not trigger | It only runs on `main` when `livekit_evals/**`, `pyproject.toml`, `MANIFEST.in` or `README.md` change. |
 
-### Major Release (Breaking Changes)
-```bash
-git add .
-git commit -m "[major] Breaking change description"
-# OR: git commit -m "BREAKING CHANGE: Description"
-git push origin main
-# → Bumps: 0.2.0 → 1.0.0
-```
+## Verify
 
-### Completely Manual
-```bash
-# Manually control version
-bump2version major  # or minor, or patch
-python -m build
-twine upload dist/*
-git push origin main
-```
-
----
-
-**Simple workflow:** Your commit message controls the version! 🚀
-
-- Regular commit → Patch (0.1.0 → 0.1.1)
-- `feat:` or `[minor]` → Minor (0.1.0 → 0.2.0)
-- `[major]` or `BREAKING CHANGE` → Major (0.2.0 → 1.0.0)
+- https://pypi.org/project/livekit-evals/
+- `pip install --upgrade livekit-evals && python -c "import livekit_evals; print(livekit_evals.__version__)"`

@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-01
+## [0.3.0] - 2026-10-12
+
+The same code first went out as 0.2.15 on 2026-10-06 because CI applied a patch bump instead of a minor one. 0.3.0 is the intended release; 0.2.15 and 0.3.0 behave identically.
 
 ### Added
 - **Prompt sync.** `create_webhook_handler(prompt=..., prompt_version=..., first_message=..., prompt_tools=...)`: each call carries `metadata.prompt_ref` (`sha256` of the template plus your label) and the template is pushed once per process per version to `POST /public-api/v1/prompts` (needs the `obs:write` scope; fails open). The push goes to `SUPERBRYN_BASE_URL`, else the webhook URL's host. `prompt_ref` / `prompt_hash` / `push_prompt` are exported.
