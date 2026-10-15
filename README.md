@@ -405,6 +405,28 @@ Example of the extended sections:
 
 ## 🛠️ Advanced Usage
 
+### Prompt Sync
+
+Keeps SuperBryn in step with the prompt your agent runs. Pass the prompt template (placeholders unfilled):
+
+```python
+PROMPT = "You are a helpful voice AI assistant for {{company}}."
+
+webhook_handler = create_webhook_handler(
+    room=ctx.room,
+    is_deployed_on_lk_cloud=True,
+    prompt=PROMPT,            # the template your agent runs
+    prompt_version="v13",     # optional: your label for this version
+)
+```
+
+- Every call carries `metadata.prompt_ref = {"hash": "sha256:...", "version": "v13"}`, and the template's text is pushed to SuperBryn once per process per version (`POST /public-api/v1/prompts`).
+- When you deploy a changed prompt, the agent's settings in SuperBryn show the change and offer to make it a new version. A prompt saved but never deployed never shows up, because no call names it.
+- Prompt sync never holds the webhook back: if the push fails, the call is still sent and is matched once the prompt text arrives.
+- The API key needs the `obs:write` scope. Keys generated in Monitor > Configure have it; with an older key a `SUPERBRYN_PROMPT_SYNC_FORBIDDEN` warning is logged once.
+- Without `prompt=`, the agent's instructions are sent as `metadata.system_prompt` (as before) and read as rendered text, so a change shows up after a few calls instead of one.
+- `first_message=` and `prompt_tools=[{"name", "description", "parameters"}]` are pushed with the prompt. `sync_prompt=False` turns it off.
+
 ### Disabling Extended Capture
 
 Extended telemetry (turn detection, network stats, errors, SIP detail, ...) is

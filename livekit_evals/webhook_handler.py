@@ -47,7 +47,8 @@ except ImportError:  # older livekit-rtc may not export these
     ConnectionQuality = None
     DisconnectReason = None
 
-from .config import CREDENTIALS_CONFIG, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
+from .config import API_BASE_URL, CREDENTIALS_CONFIG, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
+from .prompt_sync import prompt_ref, push_prompt
 from .recording_manager import RecordingManager
 
 logger = logging.getLogger("webhook_handler")
@@ -239,6 +240,11 @@ class WebhookHandler:
         defer_recording: bool = False,
         custom_data: Optional[dict[str, Any]] = None,
         extended_capture: bool = True,
+        prompt: Optional[str] = None,
+        prompt_version: Optional[str] = None,
+        first_message: Optional[str] = None,
+        prompt_tools: Optional[list[dict[str, Any]]] = None,
+        sync_prompt: bool = True,
     ):
         """
         Initialize webhook handler.
@@ -266,6 +272,16 @@ class WebhookHandler:
                 network quality + WebRTC stats, SIP attributes and DTMF, and
                 emit them as additive payload sections. Set False for the
                 legacy payload shape.
+            prompt: The prompt template your agent runs (placeholders unfilled).
+                Each call names it by hash (``metadata.prompt_ref``) and its text
+                is pushed to SuperBryn once per version, so a prompt change you
+                deploy shows up in the agent's settings right away. Without it,
+                the agent's instructions are sent as rendered text
+                (``metadata.system_prompt``) and matched after a few calls.
+            prompt_version: Your label for this prompt version (e.g. "v13").
+            first_message: The greeting template, pushed with the prompt.
+            prompt_tools: Tools the prompt uses, as ``{name, description, parameters}``.
+            sync_prompt: Set False to turn prompt sync off.
         """
         self.webhook_url = webhook_url
         self.api_key = api_key
@@ -278,6 +294,11 @@ class WebhookHandler:
         self.stereo_recording = stereo_recording
         self.defer_recording = defer_recording
         self.custom_data: dict[str, Any] = dict(custom_data) if custom_data else {}
+        self.prompt = prompt
+        self.prompt_version = prompt_version
+        self.first_message = first_message
+        self.prompt_tools = prompt_tools
+        self.sync_prompt = sync_prompt
         
         # These will be auto-detected
         self.agent_id: Optional[str] = None
@@ -1894,6 +1915,8 @@ class WebhookHandler:
                     "tts_provider": self.usage_metrics["tts_provider"],
                     "tts_voice_id": self.usage_metrics["tts_voice_id"],
                     "system_prompt": self.system_prompt,
+                    # Names the pushed prompt this call ran on (prompt sync).
+                    **({"prompt_ref": prompt_ref(self.prompt, self.prompt_version)} if self.prompt and self.sync_prompt else {}),
                     # LiveKit feature flags for cost calculation
                     "sip_trunking_enabled": self.sip_trunking_enabled,
                     "egress_enabled": self.egress_enabled,
@@ -2227,6 +2250,17 @@ class WebhookHandler:
                 except Exception as e:  # noqa: BLE001
                     logger.error("Error during recording cleanup: %s", e, exc_info=True)
             
+            # Prompt sync: SuperBryn gets the prompt's text once per version; never holds the call back.
+            if self.prompt and self.sync_prompt:
+                await push_prompt(
+                    api_key=self.api_key,
+                    api_base_url=API_BASE_URL,
+                    template=self.prompt,
+                    version=self.prompt_version,
+                    first_message=self.first_message,
+                    tools=self.prompt_tools,
+                )
+
             # Build webhook payload (egress_enabled is set by set_recording_url if recording is active)
             payload = self._build_webhook_payload()
             
@@ -2290,6 +2324,11 @@ def create_webhook_handler(
     defer_recording: bool = False,
     custom_data: Optional[dict[str, Any]] = None,
     extended_capture: bool = True,
+    prompt: Optional[str] = None,
+    prompt_version: Optional[str] = None,
+    first_message: Optional[str] = None,
+    prompt_tools: Optional[list[dict[str, Any]]] = None,
+    sync_prompt: bool = True,
 ) -> Optional[WebhookHandler]:
     """
     Factory function to create a webhook handler from environment variables.
@@ -2331,6 +2370,12 @@ def create_webhook_handler(
             latency, VAD/interruption analytics, provider errors, network
             quality + WebRTC stats, SIP attributes and DTMF as additive payload
             sections. Set False for the legacy payload shape.
+        prompt: The prompt template your agent runs. Enables exact prompt sync:
+            each call names it by hash and its text is pushed once per version.
+        prompt_version: Your label for this prompt version (e.g. "v13").
+        first_message: The greeting template, pushed with the prompt.
+        prompt_tools: Tools the prompt uses, as ``{name, description, parameters}``.
+        sync_prompt: Set False to turn prompt sync off.
 
     Returns:
         WebhookHandler instance or None if webhook is disabled
@@ -2388,6 +2433,11 @@ def create_webhook_handler(
         defer_recording=defer_recording,
         custom_data=custom_data,
         extended_capture=extended_capture,
+        prompt=prompt,
+        prompt_version=prompt_version,
+        first_message=first_message,
+        prompt_tools=prompt_tools,
+        sync_prompt=sync_prompt,
     )
     
     mode = "stereo" if stereo_recording else ("disabled" if not should_record else ("enabled" if recording_manager else "unavailable"))
