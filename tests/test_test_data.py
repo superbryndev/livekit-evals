@@ -892,6 +892,119 @@ async def test_realtime_responses_own_the_replies_that_start_after_them(http):
     ]
 
 
+def rt_event(request_id, created, ttft=0.4, duration=1.0, cancelled=False, given=0, produced=0, cached=0,
+             audio_in=0, audio_out=0, session_duration=0.0):
+    """A recorded metrics_collected event for one realtime response, stamped when it was created."""
+    metrics = SimpleNamespace(
+        type="realtime_model_metrics", request_id=request_id, timestamp=created, duration=duration, ttft=ttft,
+        cancelled=cancelled, input_tokens=given, output_tokens=produced, session_duration=session_duration,
+        input_token_details=SimpleNamespace(cached_tokens=cached, audio_tokens=audio_in, text_tokens=given - audio_in),
+        output_token_details=SimpleNamespace(audio_tokens=audio_out, text_tokens=produced - audio_out))
+    return SimpleNamespace(type="metrics_collected", metrics=metrics)
+
+
+def caller(state, at):
+    """A recorded user_state_changed event: the caller started ("speaking") or stopped ("listening") talking."""
+    return SimpleNamespace(type="user_state_changed", new_state=state, created_at=T0 + at)
+
+
+def heard(text, at, *request_ids, **fields):
+    """An agent reply the caller started hearing at `at`, with the provider response IDs LiveKit keeps on it."""
+    metrics = {"started_speaking_at": T0 + at, **({"provider_request_ids": list(request_ids)} if request_ids else {})}
+    return chat("assistant", text, at, metrics=metrics, **fields)
+
+
+async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
+    session = FakeSession(
+        heard("Hello, Acme support.", 0.4, "resp_0", id="item_greet"),
+        chat("user", "Where is my order?", 2.0, id="item_u1", transcript_confidence=0.87,
+             metrics={"started_speaking_at": T0 + 2.0}),
+        heard("It has shipped.", 3.8, "resp_1", id="item_a1"),
+        heard("Anything else?", 5.5, "resp_2", id="item_a2"),
+        chat("user", "No thanks", 7.0, id="item_u2", transcript_confidence=1.0,
+             metrics={"started_speaking_at": T0 + 7.0}),
+        heard("Bye!", 8.1, id="item_a3"),  # no provider ID: its response is the last one created before it
+        llm=Realtime())
+    session._recorded_events = [
+        rt_event("resp_0", T0 + 0.0, ttft=0.3),
+        caller("speaking", 2.0), caller("listening", 3.0),
+        rt_event("resp_1", T0 + 3.2, ttft=0.5),
+        rt_event("resp_2", T0 + 5.0, ttft=0.4),
+        caller("speaking", 7.0), caller("listening", 7.5),
+        rt_event("resp_3", T0 + 7.7, ttft=0.3),
+    ]
+    body = await ended_body(http, session)
+
+    # the greeting answers no caller speech, and a second reply in the same turn none either
+    assert body["diagnostics"]["turn_latencies"] == [
+        {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
+        {"turn_id": "item_a3", "modelLatency": 500, "turnLatency": 600},
+    ]
+    # a caller line ends when the caller stopped; LiveKit's stand-in confidence of 1.0 is left out
+    assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
+        {"id": "item_u1", "role": "user", "text": "Where is my order?", "start_ms": 2000, "end_ms": 3000,
+         "confidence": 0.87},
+        {"id": "item_u2", "role": "user", "text": "No thanks", "start_ms": 7000, "end_ms": 7500},
+    ]
+
+
+async def test_a_realtime_caller_line_stamped_after_the_caller_stopped_moves_back_to_their_speech(http):
+    # Gemini stamps a caller line with the start of the reply it prompted
+    session = FakeSession(
+        heard("Hello, Acme support.", 0.3, "GR_0", id="item_greet"),
+        chat("user", "Where is my order?", 2.6, id="item_u1", transcript_confidence=1.0,
+             metrics={"started_speaking_at": T0 + 2.6}),
+        heard("Let me check.", 2.8, "GR_1", id="item_a1"),
+        llm=Realtime())
+    session._recorded_events = [
+        rt_event("GR_0", T0 + 0.0, ttft=0.02),
+        caller("speaking", 1.0), caller("listening", 2.0),
+        rt_event("GR_1", T0 + 2.6, ttft=0.05),
+    ]
+    body = await ended_body(http, session)
+
+    assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
+        {"id": "item_u1", "role": "user", "text": "Where is my order?", "start_ms": 1000, "end_ms": 2000},
+    ]
+    assert body["diagnostics"]["turn_latencies"] == [{"turn_id": "item_a1", "modelLatency": 650, "turnLatency": 800}]
+
+
+async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
+    usage = AgentSessionUsage(model_usage=[LLMModelUsage(
+        provider="openai", model="gpt-realtime", input_tokens=1200, input_cached_tokens=300, input_audio_tokens=1000,
+        input_text_tokens=200, output_tokens=400, output_audio_tokens=350, output_text_tokens=50)])
+    session = FakeSession(heard("Hello, Acme support.", 0.5, "resp_1"), llm=Realtime(), usage=usage)
+    session._recorded_events = [
+        rt_event("resp_1", T0 + 0.0, given=1200, produced=400, cached=300, audio_in=1000, audio_out=350),
+        rt_event("resp_2", T0 + 3.0, ttft=-1, cancelled=True),  # the caller cut in before any audio
+    ]
+    diagnostics = (await ended_body(http, session))["diagnostics"]
+
+    # audio tokens count in the totals; a response the caller cut off before any audio was stopped
+    assert diagnostics["llm_requests"] == [
+        {"start_ms": 0, "outcome": "spoken", "input_tokens": 1200, "cached_input_tokens": 300, "output_tokens": 400},
+        {"start_ms": 3000, "outcome": "stopped"},
+    ]
+    assert diagnostics["usage"] == {"llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400}
+
+
+async def test_nova_sonic_pieces_are_one_response_and_xais_session_close_is_no_request(http, monkeypatch):
+    # Nova Sonic stamps on the monotonic clock (100 s here, when the wall clock reads T0 + 100) and sends usage in
+    # pieces; xAI closes with a record of the session's length, which it bills by
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    session = FakeSession(heard("Hello, Acme support.", 1.5), llm=Realtime())
+    session._recorded_events = [
+        rt_event("cmp_1", 1.0, ttft=0.3, given=600, audio_in=550),
+        rt_event("cmp_1", 2.0, ttft=0.0, produced=180, audio_out=170),
+        rt_event("session_close", T0 + 9.0, ttft=-1, session_duration=95.5),
+    ]
+    diagnostics = (await ended_body(http, session))["diagnostics"]
+
+    assert diagnostics["llm_requests"] == [
+        {"start_ms": 0, "outcome": "spoken", "input_tokens": 600, "cached_input_tokens": 0, "output_tokens": 180},
+    ]
+
+
 async def test_no_recorded_requests_sends_no_llm_requests(http):
     body = await ended_body(http, FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0)))
 

@@ -20,6 +20,7 @@ import time
 import uuid
 import weakref
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional
 
 import aiohttp
@@ -60,6 +61,10 @@ _MAX_LLM_REQUESTS = 2000
 _MAX_ERRORS = 500
 # An LLM error this long after a request's metrics were stamped still belongs to it.
 _FAILURE_SLACK_S = 1.0
+# A realtime response stamped before this (2001) is on the monotonic clock, as Nova Sonic stamps them.
+_EPOCH_FLOOR = 1e9
+# LiveKit marks the caller speaking a moment after the provider stamps the line's start.
+_SPEECH_SLACK_S = 0.25
 _MAX_ERROR_MESSAGE = 1000
 # LiveKit's error types by pipeline step; a realtime model is the LLM step
 _ERROR_STEPS = {"stt_error": "stt", "llm_error": "llm", "tts_error": "tts", "realtime_model_error": "llm"}
@@ -220,8 +225,11 @@ class _TestCall:
         # every event the session emitted, as its own session report reads them
         events = list(_attr(self.session, "_recorded_events") or ())
         requests = _section("llm_requests", _request_log, events) or []
-        base = _time_base(items, [start for start, _ in requests])
-        transcript, tool_calls = _history_payload(items, base)
+        # a realtime model hears the caller itself: when they talked comes from the session's user states
+        speech = (_section("caller_speech", _caller_speech, events) or []
+                  if _section("pipeline", _pipeline, self.session) == "realtime" else None)
+        base = _time_base(items, [start for start, _ in requests] + [start for start, _ in speech or ()])
+        transcript, tool_calls = _history_payload(items, base, speech)
         llm_requests = _section("llm_requests", _llm_requests, requests, events, items, base)
         errors = _section("errors", _errors, events, base)
         ended_reason = self.close_reason or (reason.strip() if isinstance(reason, str) else "")
@@ -231,7 +239,7 @@ class _TestCall:
             "transcript": _strict_json("transcript", transcript),
             "tool_calls": _strict_json("tool_calls", tool_calls),
             "diagnostics": _section("diagnostics", _diagnostics, self.session, items, transcript, self.tools_seen,
-                                    self.turn_detection, llm_requests, errors),
+                                    self.turn_detection, llm_requests, errors, requests, speech),
         }))
         _, answer = await _send("POST", self.base_url + _AGENT_DATA_PATH, self.api_key, body,
                                 timeout=_ENDED_TIMEOUT_S)
@@ -493,8 +501,12 @@ def _time_base(items: list[Any], starts: Iterable[float] = ()) -> float:
     return min(stamps) if stamps else 0.0
 
 
-def _history_payload(items: list[Any], base: Optional[float] = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Contract turns and tool calls from the history items; ms are from base (by default the history's first moment)."""
+def _history_payload(items: list[Any], base: Optional[float] = None,
+                     speech: Optional[list[tuple[float, Optional[float]]]] = None,
+                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Contract turns and tool calls from the history items; ms are from base (by default the history's first moment).
+    speech is set for a realtime model: caller lines take their times from it, and LiveKit's 1.0 stand-in confidence
+    is left out."""
     if base is None:
         base = _time_base(items)
 
@@ -515,12 +527,17 @@ def _history_payload(items: list[Any], base: Optional[float] = None) -> tuple[li
                 user = item.role == "user"
                 turn_id = _turn_id(item)
                 confidence = getattr(item, "transcript_confidence", None)
+                start = metrics.get("started_speaking_at") or getattr(item, "created_at", None)
+                end = metrics.get("stopped_speaking_at")
+                if user and speech is not None:
+                    start, end = _caller_span(start, end, speech)
+                    confidence = None if confidence == 1.0 else confidence
                 transcript.append(_compact({
                     "id": turn_id,
                     "role": "user" if user else "agent",
                     "text": _cut_utf16(text, _MAX_TEXT),
-                    "start_ms": ms(metrics.get("started_speaking_at") or getattr(item, "created_at", None)),
-                    "end_ms": ms(metrics.get("stopped_speaking_at")),
+                    "start_ms": ms(start),
+                    "end_ms": ms(end),
                     "confidence": confidence if user and _is_num(confidence) and 0 <= confidence <= 1 else None,
                     "interrupted": None if user else bool(getattr(item, "interrupted", False)),
                 }))
@@ -555,9 +572,12 @@ def _turn_id(item: Any) -> Optional[str]:
 def _diagnostics(session: Any, items: list[Any], transcript: list[dict[str, Any]], tools: dict[str, Optional[str]],
                  turn_detection: Optional[dict[str, Any]] = None,
                  llm_requests: Optional[list[dict[str, Any]]] = None,
-                 errors: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:
+                 errors: Optional[list[dict[str, Any]]] = None,
+                 requests: Optional[list[tuple[float, Any]]] = None,
+                 speech: Optional[list[tuple[float, Optional[float]]]] = None) -> Optional[dict[str, Any]]:
     """call.ended diagnostics, section by section: a section that fails is left out alone. turn_detection is what
-    the running agent used, when it was seen during the call; else it comes from the session's options."""
+    the running agent used, when it was seen during the call; else it comes from the session's options. speech is
+    set for a realtime model, whose reply waits come from it and the requests."""
     usage = _section("usage", list, _attr(_attr(session, "usage"), "model_usage") or ()) or []
     options = _attr(session, "options")
     configuration = {kind: _section(kind, _component, session, kind, usage) for kind in ("stt", "llm", "tts")}
@@ -569,7 +589,9 @@ def _diagnostics(session: Any, items: list[Any], transcript: list[dict[str, Any]
     diagnostics = {
         "pipeline": _section("pipeline", _pipeline, session),
         "configuration": {k: v for k, v in configuration.items() if v},
-        "turn_latencies": _section("turn_latencies", _turn_latencies, items, turn_ids),
+        "turn_latencies": (_section("turn_latencies", _turn_latencies, items, turn_ids) if speech is None else
+                           _section("turn_latencies", _realtime_turn_latencies, items, turn_ids, requests or [],
+                                    speech)),
         "usage": _section("usage", _usage, usage),
         "llm_requests": llm_requests,
         "errors": errors,
@@ -739,18 +761,121 @@ def _turn_latencies(items: list[Any], turn_ids: set[str]) -> list[dict[str, Any]
     return latencies[:_MAX_TURN_LATENCIES]
 
 
+def _caller_speech(events: list[Any]) -> list[tuple[float, Optional[float]]]:
+    """When the caller talked, as (started, stopped) from the session's user states; stopped is None when they were
+    still talking at the end."""
+    spans: list[tuple[float, Optional[float]]] = []
+    started: Optional[float] = None
+    for event in events:
+        at, state = _attr(event, "created_at"), _attr(event, "new_state")
+        if _attr(event, "type") != "user_state_changed" or not _is_num(at):
+            continue
+        if state == "speaking" and started is None:
+            started = at
+        elif state != "speaking" and started is not None:
+            spans.append((started, at))
+            started = None
+    if started is not None:
+        spans.append((started, None))
+    return spans
+
+
+def _caller_span(start: Any, end: Any, speech: list[tuple[float, Optional[float]]]) -> tuple[Any, Any]:
+    """A realtime caller line's (start, end): the end is when its speech stopped, and a line stamped after the caller
+    had already stopped (Gemini stamps its reply's start) moves back to when that speech started."""
+    if not _is_num(start):
+        return start, end
+    span = next((s for s in reversed(speech) if s[0] <= start + _SPEECH_SLACK_S), None)
+    if span is None:
+        return start, end
+    began, stopped = span
+    if stopped is not None and stopped <= start:
+        start = began
+    return start, end if _is_num(end) else stopped
+
+
+def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: list[tuple[float, Any]],
+                             speech: list[tuple[float, Optional[float]]]) -> list[dict[str, Any]]:
+    """Each realtime reply's wait from the caller stopping: modelLatency to the model's first audio, turnLatency to
+    when the agent started speaking. Its response is found by provider ID, else as the last one created before it;
+    a reply that answers no new caller speech (the greeting, a second reply) gets none."""
+    responses = [(start, m) for start, m in requests if _attr(m, "type") == "realtime_model_metrics"]
+    by_id = {_attr(m, "request_id"): (start, m) for start, m in reversed(responses) if _attr(m, "request_id")}
+    stops = [stopped for _, stopped in speech if stopped is not None]
+    answered: set[float] = set()
+    latencies: list[dict[str, Any]] = []
+    for item in items:
+        if getattr(item, "type", None) != "message" or getattr(item, "role", None) != "assistant":
+            continue
+        metrics = _metrics(item)
+        heard = metrics.get("started_speaking_at")
+        if not _is_num(heard):
+            continue
+        ids = metrics.get("provider_request_ids") or ()
+        response = (next((by_id[i] for i in ids if isinstance(i, str) and i in by_id), None)
+                    or next((r for r in reversed(responses) if r[0] <= heard), None))
+        created = response[0] if response else heard
+        stopped = next((t for t in reversed(stops) if t <= created), None)
+        if stopped is None or stopped in answered:
+            continue
+        answered.add(stopped)
+        ttft = _attr(response[1], "ttft") if response else None
+        first_audio = created + ttft if _is_num(ttft) and ttft >= 0 else None
+        entry = _compact({
+            "modelLatency": _millis(first_audio - stopped) if first_audio is not None else None,
+            "turnLatency": _millis(heard - stopped),
+        })
+        if entry:
+            turn_id = _turn_id(item)
+            latencies.append({"turn_id": turn_id, **entry} if turn_id in turn_ids else entry)
+    return latencies[:_MAX_TURN_LATENCIES]
+
+
 def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
-    """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first."""
+    """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. A Nova
+    Sonic response (monotonic stamps, usage in pieces) is one response; xAI's session-close record is no response."""
     log = []
+    pieces: dict[Any, list[tuple[float, Any]]] = {}
+    clock = time.time() - time.monotonic()
     for event in events:
         metrics = _attr(event, "metrics") if _attr(event, "type") == "metrics_collected" else None
         kind, stamp, duration = _attr(metrics, "type"), _attr(metrics, "timestamp"), _attr(metrics, "duration")
+        if kind == "realtime_model_metrics":
+            request_id = _attr(metrics, "request_id")
+            if request_id == "session_close":
+                continue
+            if _is_num(stamp) and 0 < stamp < _EPOCH_FLOOR:
+                key = request_id if isinstance(request_id, str) and request_id else id(metrics)
+                pieces.setdefault(key, []).append((stamp + clock, metrics))
+                continue
         if kind not in ("llm_metrics", "realtime_model_metrics") or not (_is_num(stamp) and stamp > 0):
             continue
         # an LLM request is stamped when it ends; a realtime response when it is created
         ended = kind == "llm_metrics" and _is_num(duration) and duration > 0
         log.append((stamp - duration if ended else stamp, metrics))
+    for parts in pieces.values():
+        stamps = [stamp for stamp, _ in parts if _is_num(stamp) and stamp > 0]
+        if stamps:
+            log.append((min(stamps), parts[0][1] if len(parts) == 1 else _merged_response([m for _, m in parts])))
     return sorted(log, key=lambda entry: entry[0])
+
+
+def _merged_response(parts: list[Any]) -> Any:
+    """One realtime response from the pieces it was reported in: tokens summed, the first time to first audio."""
+    def total(*path: str) -> int:
+        values = []
+        for part in parts:
+            value = part
+            for name in path:
+                value = _attr(value, name)
+            values.append(value)
+        return int(sum(v for v in values if _is_num(v) and v >= 0))
+
+    ttfts = [_attr(p, "ttft") for p in parts if _is_num(_attr(p, "ttft")) and _attr(p, "ttft") >= 0]
+    return SimpleNamespace(
+        type="realtime_model_metrics", request_id=_attr(parts[0], "request_id"), ttft=ttfts[0] if ttfts else -1,
+        input_tokens=total("input_tokens"), output_tokens=total("output_tokens"),
+        input_token_details=SimpleNamespace(cached_tokens=total("input_token_details", "cached_tokens")))
 
 
 def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[Any],
