@@ -32,6 +32,12 @@ dependencies = [
     "aiohttp>=3.9.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [project.urls]
 Homepage = "https://github.com/superbryndev/livekit-evals"
 Documentation = "https://github.com/superbryndev/livekit-evals#readme"
@@ -43,3 +49,7 @@ where = ["."]
 include = ["livekit_evals*"]
 exclude = ["tests*", "examples*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
