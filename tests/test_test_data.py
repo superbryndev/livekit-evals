@@ -150,14 +150,14 @@ class FakeRealtime(llm.RealtimeModel):
 class Realtime(llm.RealtimeModel):
     """A realtime model that detects turns itself, as OpenAI's does by default."""
 
-    def __init__(self, model="gpt-realtime"):
+    def __init__(self, model="gpt-realtime", provider="openai"):
         super().__init__(capabilities=llm.RealtimeCapabilities(
             message_truncation=True, turn_detection=True, user_transcription=True,
             auto_tool_reply_generation=False, audio_output=True, manual_function_calls=True))
-        self._model = model
+        self._model, self._provider = model, provider
 
     model = property(lambda self: self._model)
-    provider = property(lambda self: "openai")
+    provider = property(lambda self: self._provider)
 
     def session(self, *, turn_detection_disabled=False):
         raise NotImplementedError
@@ -923,7 +923,7 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
         heard("Anything else?", 5.5, "resp_2", id="item_a2"),
         chat("user", "No thanks", 7.0, id="item_u2", transcript_confidence=1.0,
              metrics={"started_speaking_at": T0 + 7.0}),
-        heard("Bye!", 8.1, id="item_a3"),  # no provider ID and no VAD: when the caller stopped can't be told
+        heard("Bye!", 8.1, id="item_a3"),  # no provider ID: its wait counts, the model's part can't be told
         llm=Realtime())
     session._recorded_events = [
         rt_event("resp_0", T0 + 0.0, ttft=0.3),
@@ -938,6 +938,7 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
     # the greeting answers no caller speech, and a second reply in the same turn none either
     assert body["diagnostics"]["turn_latencies"] == [
         {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
+        {"turn_id": "item_a3", "turnLatency": 600},
     ]
     # a caller line ends when the caller stopped; LiveKit's stand-in confidence of 1.0 is left out
     assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
@@ -976,19 +977,20 @@ def nova_session(**attributes):
         heard("Hello, Skyway Airlines.", 0.5, "lk_greet", id="item_greet"),
         chat("user", "My flight got cancelled?", 1.0, id="item_u1", metrics={"started_speaking_at": T0 + 1.0}),
         heard("Yes, I can rebook you.", 3.1, "lk_reply", id="item_a1"),
-        llm=Realtime(), **attributes)
+        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"), **attributes)
     session._recorded_events = [
         rt_event("cmp_0", 0.1, ttft=0.2), caller("speaking", 1.0), rt_event("cmp_0", 1.2, ttft=0.6),
         caller("listening", 2.9)]
     return session
 
 
-async def test_nova_sonic_replies_get_no_wait_without_a_vad(http, monkeypatch):
+async def test_nova_sonic_replies_get_no_wait_and_its_caller_lines_no_times_without_a_vad(http, monkeypatch):
     # its "caller stopped" is when its own reply started: a wait from it would be the playback delay alone
     monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
-    diagnostics = (await ended_body(http, nova_session()))["diagnostics"]
+    body = await ended_body(http, nova_session())
 
-    assert "turn_latencies" not in diagnostics
+    assert "turn_latencies" not in body["diagnostics"]
+    assert body["transcript"][1] == {"id": "item_u1", "role": "user", "text": "My flight got cancelled?"}
 
 
 async def test_a_realtime_reply_with_a_vad_gets_its_wait_without_the_models_part(http, monkeypatch):
@@ -997,6 +999,34 @@ async def test_a_realtime_reply_with_a_vad_gets_its_wait_without_the_models_part
     diagnostics = (await ended_body(http, nova_session(vad=object())))["diagnostics"]
 
     assert diagnostics["turn_latencies"] == [{"turn_id": "item_a1", "turnLatency": 200}]
+
+
+async def test_gemini_live_replies_found_by_id_still_get_no_wait_its_caller_stops_are_stand_ins(http):
+    # Gemini Live's IDs match its responses, but LiveKit marks the caller stopped as its reply starts (1-230 ms
+    # before it on recorded calls), so neither a wait nor caller times can be told
+    session = FakeSession(
+        chat("user", "Where is my order?", 2.0, id="item_u1", metrics={"started_speaking_at": T0 + 2.0}),
+        heard("It has shipped.", 3.4, "resp_1", id="item_a1"),
+        llm=Realtime("google/gemini-3.8-live", "livekit"))
+    session._recorded_events = [caller("speaking", 2.0), rt_event("resp_1", T0 + 2.5, ttft=0.8),
+                                caller("listening", 3.3)]
+    body = await ended_body(http, session)
+
+    assert "turn_latencies" not in body["diagnostics"]
+    assert body["transcript"][0] == {"id": "item_u1", "role": "user", "text": "Where is my order?"}
+
+
+async def test_the_empty_record_a_realtime_session_opens_with_and_shared_ids_are_no_requests(http):
+    # every realtime session opens with a record of no request, tokens or ttft; GPT Live keeps one ID for the session
+    opening = rt_event(None, T0 + 0.0, ttft=-1, duration=0.0)
+    session = FakeSession(chat("user", "Hi", 0.0), heard("Hello, Acme support.", 0.5, "resp_1"), llm=Realtime())
+    session._recorded_events = [opening, rt_event("resp_1", T0 + 0.2, ttft=0.3, given=50, produced=20)]
+    assert (await ended_body(http, session))["diagnostics"]["llm_requests"] == [
+        {"start_ms": 200, "outcome": "spoken", "input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 20}]
+
+    live = FakeSession(heard("Hi.", 1.5, "item_1"), heard("Sure.", 6.0, "item_2"), llm=Realtime("openai/gpt-live-1"))
+    live._recorded_events = [opening, rt_event("live_1", T0 + 1.0, ttft=-1), rt_event("live_1", T0 + 5.5, ttft=-1)]
+    assert "llm_requests" not in (await ended_body(http, live))["diagnostics"]
 
 
 async def test_a_realtime_reply_found_by_id_pairs_with_the_stop_before_its_response(http):

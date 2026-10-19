@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 import weakref
+from collections import Counter
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional
@@ -234,7 +235,9 @@ class _TestCall:
         base = _time_base(items, [start for start, _ in requests] + [start for start, _ in speech or ()])
         # LiveKit Inference STT says 1.0 when its gateway gives no confidence, as realtime models do
         stand_in = _inference_stt(self.session)
-        transcript, tool_calls = _history_payload(items, base, speech, stand_in)
+        # a realtime model that marks the caller stopped only once its reply starts has no real caller times
+        caller_times = speech is None or _caller_times_real(self.session)
+        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times)
         llm_requests = _section("llm_requests", _llm_requests, requests, events, items, base)
         errors = _section("errors", _errors, events, base)
         ended_reason = self.close_reason or (reason.strip() if isinstance(reason, str) else "")
@@ -509,10 +512,11 @@ def _time_base(items: list[Any], starts: Iterable[float] = ()) -> float:
 
 def _history_payload(items: list[Any], base: Optional[float] = None,
                      speech: Optional[list[tuple[float, Optional[float]]]] = None, stand_in_confidence: bool = False,
-                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                     caller_times: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Contract turns and tool calls from the history items; ms are from base (by default the history's first moment).
     speech is set for a realtime model: caller lines take their times from it. LiveKit's 1.0 stand-in confidence is
-    left out for a realtime model and when stand_in_confidence is set (LiveKit Inference STT)."""
+    left out for a realtime model and when stand_in_confidence is set (LiveKit Inference STT). Without caller_times
+    (a realtime model whose caller times are stand-ins), caller lines carry no times."""
     if base is None:
         base = _time_base(items)
 
@@ -536,7 +540,7 @@ def _history_payload(items: list[Any], base: Optional[float] = None,
                 start = metrics.get("started_speaking_at") or getattr(item, "created_at", None)
                 end = metrics.get("stopped_speaking_at")
                 if user and speech is not None:
-                    start, end = _caller_span(start, end, speech)
+                    start, end = _caller_span(start, end, speech) if caller_times else (None, None)
                 if user and (speech is not None or stand_in_confidence) and confidence == 1.0:
                     confidence = None
                 transcript.append(_compact({
@@ -604,7 +608,7 @@ def _diagnostics(session: Any, items: list[Any], transcript: list[dict[str, Any]
         "configuration": {k: v for k, v in configuration.items() if v},
         "turn_latencies": (_section("turn_latencies", _turn_latencies, items, turn_ids) if speech is None else
                            _section("turn_latencies", _realtime_turn_latencies, items, turn_ids, requests or [],
-                                    speech, _attr(session, "vad") is not None)),
+                                    speech, _caller_times_real(session))),
         "usage": _section("usage", _usage, usage),
         "llm_requests": llm_requests,
         "errors": errors,
@@ -650,6 +654,23 @@ def _component(session: Any, kind: str, usage: list[Any]) -> dict[str, str]:
         fields["voice"] = _first_name(_attr(base, "voice_id"), _attr(base, "voice"),
                                       _attr(opts, "voice_id"), _attr(opts, "voice"))
     return _compact(fields)
+
+
+# Realtime models whose own speech detection reports when the caller really stopped (OpenAI's server VAD, xAI's).
+# Others mark the caller stopped only once their reply starts (Nova Sonic, Gemini Live) or are unverified.
+_REAL_CALLER_STOPS = ("gpt-realtime", "gpt-4o-realtime", "gpt-4o-mini-realtime", "grok")
+
+
+def _caller_times_real(session: Any) -> bool:
+    """Whether a realtime session's caller start and stop times are real: with a VAD on the session they are
+    LiveKit's own; without, only for the models in _REAL_CALLER_STOPS. Quietly False when the model can't be read."""
+    if _attr(session, "vad") is not None:
+        return True
+    try:
+        model = (_component(session, "llm", []).get("model") or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(name in model for name in _REAL_CALLER_STOPS)
 
 
 def _inference_stt(session: Any) -> bool:
@@ -836,14 +857,16 @@ def _caller_span(start: Any, end: Any, speech: list[tuple[float, Optional[float]
 
 
 def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: list[tuple[float, Any]],
-                             speech: list[tuple[float, Optional[float]]], caller_heard: bool = False,
+                             speech: list[tuple[float, Optional[float]]], caller_real: bool = False,
                              ) -> list[dict[str, Any]]:
     """Each realtime reply's wait from the caller stopping: turnLatency to when the agent started speaking, and
-    modelLatency to the model's first audio. A reply whose response is found by provider ID (OpenAI, Gemini) is
-    paired with the caller's last stop before that response was created, and gets both. Without that match, only a
-    session with its own VAD knows when the caller stopped: it pairs the reply with the last stop before it started
-    speaking and sends turnLatency alone. Otherwise (Nova Sonic, which marks the caller stopped only once its reply
-    starts) none. A reply that answers no new caller speech (the greeting, a second reply) gets none either."""
+    modelLatency to the model's first audio. Only when the caller's stops are real (caller_real: a VAD on the
+    session, or a model whose speech detection reports them); else none, rather than a wait from a stand-in stop.
+    A reply whose response is found by provider ID is paired with the caller's last stop before that response was
+    created, and gets both; without the match, with the last stop before it started speaking, turnLatency alone. A
+    reply that answers no new caller speech (the greeting, a second reply) gets none."""
+    if not caller_real:
+        return []
     responses = [(start, m) for start, m in requests if _attr(m, "type") == "realtime_model_metrics"]
     by_id = {_attr(m, "request_id"): (start, m) for start, m in reversed(responses) if _attr(m, "request_id")}
     stops = [stopped for _, stopped in speech if stopped is not None]
@@ -858,14 +881,12 @@ def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: lis
             continue
         ids = metrics.get("provider_request_ids") or ()
         response = next((by_id[i] for i in ids if isinstance(i, str) and i in by_id), None)
-        if response is None and not caller_heard:
-            continue
         stopped = next((t for t in reversed(stops) if t <= (response[0] if response else heard)), None)
         if stopped is None or stopped in answered:
             continue
         answered.add(stopped)
         ttft = _attr(response[1], "ttft") if response else None
-        first_audio = response[0] + ttft if response and _is_num(ttft) and ttft >= 0 else None
+        first_audio = response[0] + ttft if response and _is_num(ttft) and ttft > 0 else None  # 0: a placeholder
         entry = _compact({
             "modelLatency": _millis(first_audio - stopped) if first_audio is not None else None,
             "turnLatency": _millis(heard - stopped),
@@ -876,16 +897,23 @@ def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: lis
 
 
 def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
-    """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. Nova
-    Sonic's records are no requests: it stamps them on the monotonic clock as usage pieces under one completionId for
-    the whole session (its tokens still count in usage). xAI's session-close record is no response either."""
+    """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. These
+    realtime records are no responses: the empty one every session opens with (no request_id, tokens or ttft),
+    xAI's session-close record, Nova Sonic's (usage pieces on the monotonic clock), and any whose request_id repeats,
+    i.e. one ID for the whole session (Nova Sonic's completionId, GPT Live's); their tokens still count in usage."""
     log = []
+    seen = Counter(_attr(_attr(e, "metrics"), "request_id") for e in events if _attr(e, "type") == "metrics_collected"
+                   and _attr(_attr(e, "metrics"), "type") == "realtime_model_metrics")
     for event in events:
         metrics = _attr(event, "metrics") if _attr(event, "type") == "metrics_collected" else None
         kind, stamp, duration = _attr(metrics, "type"), _attr(metrics, "timestamp"), _attr(metrics, "duration")
-        if kind == "realtime_model_metrics" and (_attr(metrics, "request_id") == "session_close"
-                                                 or (_is_num(stamp) and 0 < stamp < _EPOCH_FLOOR)):
-            continue
+        if kind == "realtime_model_metrics":
+            request_id = _attr(metrics, "request_id")
+            empty = not request_id and not _request_tokens(metrics, True) and not (_is_num(_attr(metrics, "ttft"))
+                                                                                  and _attr(metrics, "ttft") >= 0)
+            if (empty or request_id == "session_close" or (_is_num(stamp) and 0 < stamp < _EPOCH_FLOOR)
+                    or (request_id and seen[request_id] > 1)):
+                continue
         if kind not in ("llm_metrics", "realtime_model_metrics") or not (_is_num(stamp) and stamp > 0):
             continue
         # an LLM request is stamped when it ends; a realtime response when it is created
