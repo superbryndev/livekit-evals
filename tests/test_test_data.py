@@ -150,14 +150,14 @@ class FakeRealtime(llm.RealtimeModel):
 class Realtime(llm.RealtimeModel):
     """A realtime model that detects turns itself, as OpenAI's does by default."""
 
-    def __init__(self, model="gpt-realtime"):
+    def __init__(self, model="gpt-realtime", provider="openai"):
         super().__init__(capabilities=llm.RealtimeCapabilities(
             message_truncation=True, turn_detection=True, user_transcription=True,
             auto_tool_reply_generation=False, audio_output=True, manual_function_calls=True))
-        self._model = model
+        self._model, self._provider = model, provider
 
     model = property(lambda self: self._model)
-    provider = property(lambda self: "openai")
+    provider = property(lambda self: self._provider)
 
     def session(self, *, turn_detection_disabled=False):
         raise NotImplementedError
@@ -923,7 +923,7 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
         heard("Anything else?", 5.5, "resp_2", id="item_a2"),
         chat("user", "No thanks", 7.0, id="item_u2", transcript_confidence=1.0,
              metrics={"started_speaking_at": T0 + 7.0}),
-        heard("Bye!", 8.1, id="item_a3"),  # no provider ID: its response is the last one created before it
+        heard("Bye!", 8.1, id="item_a3"),  # no provider ID: its wait counts, the model's part can't be told
         llm=Realtime())
     session._recorded_events = [
         rt_event("resp_0", T0 + 0.0, ttft=0.3),
@@ -938,7 +938,7 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
     # the greeting answers no caller speech, and a second reply in the same turn none either
     assert body["diagnostics"]["turn_latencies"] == [
         {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
-        {"turn_id": "item_a3", "modelLatency": 500, "turnLatency": 600},
+        {"turn_id": "item_a3", "turnLatency": 600},
     ]
     # a caller line ends when the caller stopped; LiveKit's stand-in confidence of 1.0 is left out
     assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
@@ -969,6 +969,124 @@ async def test_a_realtime_caller_line_stamped_after_the_caller_stopped_moves_bac
     assert body["diagnostics"]["turn_latencies"] == [{"turn_id": "item_a1", "modelLatency": 650, "turnLatency": 800}]
 
 
+def nova_session(**attributes):
+    """A Nova Sonic call: responses on the monotonic clock (0.1 s is T0 + 0.1, as the clocks read T0 + 100 and 100)
+    stamped while the caller still talks, the caller marked stopped only once the reply starts, and a LiveKit ID on
+    the reply that no response carries."""
+    session = FakeSession(
+        heard("Hello, Skyway Airlines.", 0.5, "lk_greet", id="item_greet"),
+        chat("user", "My flight got cancelled?", 1.0, id="item_u1", metrics={"started_speaking_at": T0 + 1.0}),
+        heard("Yes, I can rebook you.", 3.1, "lk_reply", id="item_a1"),
+        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"), **attributes)
+    session._recorded_events = [
+        rt_event("cmp_0", 0.1, ttft=0.2), caller("speaking", 1.0), rt_event("cmp_0", 1.2, ttft=0.6),
+        caller("listening", 2.9)]
+    return session
+
+
+async def test_nova_sonic_replies_get_no_wait_and_its_caller_lines_no_times_without_a_vad(http, monkeypatch):
+    # its "caller stopped" is when its own reply started: a wait from it would be the playback delay alone
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    body = await ended_body(http, nova_session())
+
+    assert "turn_latencies" not in body["diagnostics"]
+    assert body["transcript"][1] == {"id": "item_u1", "role": "user", "text": "My flight got cancelled?"}
+
+
+async def test_a_realtime_reply_with_a_vad_gets_its_wait_without_the_models_part(http, monkeypatch):
+    # with a VAD on the session the caller's stops are real: the reply pairs with the last one before it was heard
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    diagnostics = (await ended_body(http, nova_session(vad=object())))["diagnostics"]
+
+    assert diagnostics["turn_latencies"] == [{"turn_id": "item_a1", "turnLatency": 200}]
+
+
+async def test_gemini_live_replies_found_by_id_still_get_no_wait_its_caller_stops_are_stand_ins(http):
+    # Gemini Live's IDs match its responses, but LiveKit marks the caller stopped as its reply starts (1-230 ms
+    # before it on recorded calls), so neither a wait nor caller times can be told
+    session = FakeSession(
+        chat("user", "Where is my order?", 2.0, id="item_u1", metrics={"started_speaking_at": T0 + 2.0}),
+        heard("It has shipped.", 3.4, "resp_1", id="item_a1"),
+        llm=Realtime("google/gemini-3.8-live", "livekit"))
+    session._recorded_events = [caller("speaking", 2.0), rt_event("resp_1", T0 + 2.5, ttft=0.8),
+                                caller("listening", 3.3)]
+    body = await ended_body(http, session)
+
+    assert "turn_latencies" not in body["diagnostics"]
+    assert body["transcript"][0] == {"id": "item_u1", "role": "user", "text": "Where is my order?"}
+
+
+async def test_the_empty_record_a_realtime_session_opens_with_and_shared_ids_are_no_requests(http):
+    # every realtime session opens with a record of no request, tokens or ttft; GPT Live keeps one ID for the session
+    opening = rt_event(None, T0 + 0.0, ttft=-1, duration=0.0)
+    session = FakeSession(chat("user", "Hi", 0.0), heard("Hello, Acme support.", 0.5, "resp_1"), llm=Realtime())
+    session._recorded_events = [opening, rt_event("resp_1", T0 + 0.2, ttft=0.3, given=50, produced=20)]
+    assert (await ended_body(http, session))["diagnostics"]["llm_requests"] == [
+        {"start_ms": 200, "outcome": "spoken", "input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 20}]
+
+    live = FakeSession(heard("Hi.", 1.5, "item_1"), heard("Sure.", 6.0, "item_2"), llm=Realtime("openai/gpt-live-1"))
+    live._recorded_events = [opening, rt_event("live_1", T0 + 1.0, ttft=-1), rt_event("live_1", T0 + 5.5, ttft=-1)]
+    assert "llm_requests" not in (await ended_body(http, live))["diagnostics"]
+
+
+async def test_a_realtime_reply_found_by_id_pairs_with_the_stop_before_its_response(http):
+    # the caller speaks again between the response's creation and its playback: that later speech is the next
+    # reply's to answer
+    session = FakeSession(
+        chat("user", "Where is my order?", 2.0, id="item_u1", metrics={"started_speaking_at": T0 + 2.0}),
+        heard("It has shipped.", 3.8, "resp_1", id="item_a1"),
+        chat("user", "Okay", 3.3, id="item_u2", metrics={"started_speaking_at": T0 + 3.3}),
+        heard("Anything else?", 5.0, "resp_2", id="item_a2"),
+        llm=Realtime())
+    session._recorded_events = [
+        caller("speaking", 2.0), caller("listening", 3.0),
+        rt_event("resp_1", T0 + 3.2, ttft=0.5),
+        caller("speaking", 3.3), caller("listening", 3.5),
+        rt_event("resp_2", T0 + 4.6, ttft=0.3),
+    ]
+    diagnostics = (await ended_body(http, session))["diagnostics"]
+
+    assert diagnostics["turn_latencies"] == [
+        {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
+        {"turn_id": "item_a2", "modelLatency": 1400, "turnLatency": 1500},
+    ]
+
+
+async def test_a_realtime_model_reports_its_voice_and_only_whether_it_can_be_interrupted(http):
+    model = Realtime()
+    model._opts = SimpleNamespace(voice="marin")
+    options = SimpleNamespace(turn_handling={"interruption": {"enabled": True, "min_duration": 0.5, "min_words": 2}})
+    session = FakeSession(heard("Hello, Acme support.", 0.5, "resp_1"), llm=model, options=options)
+    configuration = (await ended_body(http, session))["diagnostics"]["configuration"]
+
+    # the model's own speech detection interrupts it: LiveKit's duration and word gates don't apply
+    assert configuration["interruptions"] == {"enabled": True}
+    assert configuration["tts"] == {"provider": "openai", "model": "gpt-realtime", "voice": "marin"}
+
+
+async def test_zero_seconds_of_stt_audio_is_not_sent(http):
+    # OpenAI's realtime transcription bills tokens and reports 0 s of audio
+    usage = SimpleNamespace(model_usage=[
+        SimpleNamespace(type="stt_usage", provider="openai", model="gpt-4o-transcribe", audio_duration=0.0),
+        LLMModelUsage(provider="openai", model="gpt-realtime", input_tokens=10, output_tokens=5)])
+    session = FakeSession(heard("Hello, Acme support.", 0.5, "resp_1"), llm=Realtime(), usage=usage)
+    diagnostics = (await ended_body(http, session))["diagnostics"]
+
+    assert diagnostics["usage"] == {"llm_input_tokens": 10, "llm_cached_input_tokens": 0, "llm_output_tokens": 5}
+
+
+async def test_a_realtime_response_that_failed_while_it_ran_is_stopped(http):
+    # the failure comes 1.5 s after the response was created, within the 2 s it ran
+    session = FakeSession(chat("user", "Hi", 0.0), llm=Realtime())
+    error = SimpleNamespace(type="realtime_model_error", timestamp=T0 + 2.5, label="openai.realtime",
+                            error=RuntimeError("server error"), recoverable=False)
+    session._recorded_events = [rt_event("resp_1", T0 + 1.0, ttft=0.3, duration=2.0),
+                                SimpleNamespace(type="error", created_at=T0 + 2.5, error=error)]
+    diagnostics = (await ended_body(http, session))["diagnostics"]
+
+    assert diagnostics["llm_requests"] == [{"start_ms": 1000, "outcome": "stopped"}]
+
+
 async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
     usage = AgentSessionUsage(model_usage=[LLMModelUsage(
         provider="openai", model="gpt-realtime", input_tokens=1200, input_cached_tokens=300, input_audio_tokens=1000,
@@ -988,21 +1106,58 @@ async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
     assert diagnostics["usage"] == {"llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400}
 
 
-async def test_nova_sonic_pieces_are_one_response_and_xais_session_close_is_no_request(http, monkeypatch):
-    # Nova Sonic stamps on the monotonic clock (100 s here, when the wall clock reads T0 + 100) and sends usage in
-    # pieces; xAI closes with a record of the session's length, which it bills by
+# Nova Sonic's 38 usage pieces from a recorded 2.5 Sonic call, one completionId for them all: (monotonic s, input
+# text, input audio, output text, output audio, ttft). A reply's output pieces carry one ttft, the caller's input none.
+NOVA_PIECES = [
+    (4.913, 22, 0, 0, 0, 0.0), (5.023, 0, 157, 0, 0, 0.0), (5.024, 1, 0, 0, 0, 0.0), (5.131, 12, 0, 0, 0, 0.0),
+    (5.134, 43, 0, 0, 0, 0.0), (5.172, 4, 0, 0, 0, 0.0), (5.275, 302, 0, 0, 0, 0.0), (5.551, 0, 0, 13, 0, 0.0),
+    (5.82, 0, 0, 2, 18, 0.0028848648071289062), (6.093, 0, 0, 0, 20, 0.0028848648071289062),
+    (6.678, 0, 0, 0, 20, 0.0028848648071289062), (20.617, 0, 100, 0, 0, 0.0), (20.618, 3, 0, 0, 0, 0.0),
+    (20.777, 0, 0, 15, 5, 0.0), (20.834, 0, 7, 0, 0, 0.0), (20.845, 3, 0, 0, 0, 0.0), (21.033, 0, 3, 0, 0, 0.0),
+    (21.033, 3, 0, 0, 0, 0.0), (21.055, 1, 0, 0, 0, 0.0), (21.591, 0, 0, 11, 0, 0.0),
+    (21.632, 0, 0, 6, 14, 0.0009641647338867188), (23.507, 0, 0, 0, 20, 0.0009641647338867188),
+    (24.755, 0, 0, 4, 16, 0.0009641647338867188), (31.756, 0, 81, 0, 0, 0.0), (31.756, 3, 0, 0, 0, 0.0),
+    (32.327, 0, 0, 12, 0, 0.0), (32.384, 0, 0, 15, 5, 0.0023860931396484375),
+    (32.798, 0, 0, 0, 20, 0.0023860931396484375), (33.228, 0, 0, 0, 20, 0.0023860931396484375),
+    (33.857, 0, 0, 0, 20, 0.0023860931396484375), (46.319, 0, 100, 0, 0, 0.0), (46.319, 3, 0, 0, 0, 0.0),
+    (46.445, 0, 0, 15, 5, 0.0), (46.956, 0, 17, 0, 0, 0.0), (46.956, 3, 0, 0, 0, 0.0), (46.974, 1, 0, 0, 0, 0.0),
+    (47.347, 0, 0, 11, 0, 0.0), (47.496, 0, 0, 7, 13, 0.0012772083282470703),
+]
+
+
+async def test_nova_sonic_usage_pieces_become_one_request_per_reply(http, monkeypatch):
+    # on the monotonic clock: 4.9 s is T0 + 4.9, as the clocks read T0 + 100 and 100
     monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
-    session = FakeSession(heard("Hello, Acme support.", 1.5), llm=Realtime())
+    session = FakeSession(
+        chat("user", "", 0.0),  # the session's start
+        heard("Hello, this is the Brief Voice AI model.", 7.29, "lk_greet"),
+        chat("user", "hello who are you and what model are you", 21.59),
+        heard("I am the Brief Voice AI model.", 21.80, "lk_reply_1"),
+        chat("user", "what are some things you can help me with", 32.34),
+        heard("I can answer questions and give brief replies.", 32.44, "lk_reply_2"),
+        chat("user", "can you tell me one interesting fact about space", 47.37),
+        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"))
     session._recorded_events = [
-        rt_event("cmp_1", 1.0, ttft=0.3, given=600, audio_in=550),
-        rt_event("cmp_1", 2.0, ttft=0.0, produced=180, audio_out=170),
-        rt_event("session_close", T0 + 9.0, ttft=-1, session_duration=95.5),
-    ]
+        rt_event("7316680d", at, ttft=ttft, duration=0.0, given=it + ia, produced=ot + oa, audio_in=ia, audio_out=oa)
+        for at, it, ia, ot, oa, ttft in NOVA_PIECES]
     diagnostics = (await ended_body(http, session))["diagnostics"]
 
+    # 869 tokens in and 307 out, the session's; the call ended before the fourth reply was heard
     assert diagnostics["llm_requests"] == [
-        {"start_ms": 0, "outcome": "spoken", "input_tokens": 600, "cached_input_tokens": 0, "output_tokens": 180},
+        {"start_ms": 5820, "outcome": "spoken", "input_tokens": 541, "cached_input_tokens": 0, "output_tokens": 73},
+        {"start_ms": 21632, "outcome": "spoken", "input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 91},
+        {"start_ms": 32384, "outcome": "spoken", "input_tokens": 84, "cached_input_tokens": 0, "output_tokens": 92},
+        {"start_ms": 47496, "outcome": "not_spoken", "input_tokens": 124, "cached_input_tokens": 0,
+         "output_tokens": 51},
     ]
+
+
+async def test_xais_session_close_record_is_no_request(http):
+    # xAI closes with a record of the session's length, which it bills by
+    session = FakeSession(chat("user", "Hi", 0.0), heard("Hello, Acme support.", 1.5, "resp_1"), llm=Realtime())
+    session._recorded_events = [rt_event("session_close", T0 + 9.0, ttft=-1, session_duration=95.5)]
+
+    assert "llm_requests" not in (await ended_body(http, session))["diagnostics"]
 
 
 async def test_no_recorded_requests_sends_no_llm_requests(http):
@@ -1033,9 +1188,68 @@ async def test_pipeline_failures_are_sent_as_errors(http):
     assert body["diagnostics"]["errors"] == [
         {"step": "stt", "side": "caller", "start_ms": 2000, "message": "deepgram.STT: connection closed: <url>",
          "recovered": True},
-        {"step": "llm", "start_ms": 3000, "message": "openai.LLM: rate limited", "recovered": False},
-        {"step": "llm", "start_ms": 4000, "message": "openai.LLM: rate limited", "recovered": False},
-        {"step": "tts", "start_ms": 5000, "message": "cartesia.TTS: voice not found", "recovered": False},
+        {"step": "llm", "side": "agent", "start_ms": 3000, "message": "openai.LLM: rate limited", "recovered": False},
+        {"step": "llm", "side": "agent", "start_ms": 4000, "message": "openai.LLM: rate limited", "recovered": False},
+        {"step": "tts", "side": "agent", "start_ms": 5000, "message": "cartesia.TTS: voice not found",
+         "recovered": False},
+    ]
+
+
+async def test_a_retried_failure_recovered_when_its_step_worked_again_before_failing_for_good(http):
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))
+    worked = SimpleNamespace(type="metrics_collected", metrics=SimpleNamespace(
+        type="llm_metrics", timestamp=T0 + 3.0, duration=0.4, ttft=0.2, speech_id=None))
+    session._recorded_events = [
+        error_event("llm_error", 2.0, "rate limited", True, "openai.LLM"),  # retried, and the LLM worked at 3 s
+        worked,
+        error_event("llm_error", 6.0, "rate limited", False, "openai.LLM"),  # later, a failure for good
+    ]
+    body = await ended_body(http, session)
+
+    assert body["diagnostics"]["errors"] == [
+        {"step": "llm", "side": "agent", "start_ms": 2000, "end_ms": 3000, "message": "openai.LLM: rate limited",
+         "recovered": True},
+        {"step": "llm", "side": "agent", "start_ms": 6000, "message": "openai.LLM: rate limited", "recovered": False},
+    ]
+
+
+async def test_live_interruptions_are_what_livekit_resolved():  # real AgentSession + AgentActivity, not started
+    stt = SimpleNamespace(capabilities=SimpleNamespace(streaming=True, aligned_transcript=False))
+    session = AgentSession(stt=stt, vad=None, turn_handling={"turn_detection": "stt"})
+    assert test_data._live_interruptions(AgentActivity(Agent(instructions="x"), session)) == {
+        "enabled": True, "min_duration_ms": 500, "min_words": 0}
+    off = Agent(instructions="x", allow_interruptions=False)  # the agent's own setting wins over the session's
+    assert test_data._live_interruptions(AgentActivity(off, session))["enabled"] is False
+    own = Agent(instructions="x", turn_handling={"interruption": {"min_duration": 1.2, "min_words": 2}})
+    assert test_data._live_interruptions(AgentActivity(own, session)) == {
+        "enabled": True, "min_duration_ms": 1200, "min_words": 2}
+    assert test_data._live_interruptions(None) is None
+
+
+async def test_livekit_inference_stt_stand_in_confidence_is_left_out(http):
+    # LiveKit Inference STT says 1.0 when its gateway gives no confidence
+    line = chat("user", "Hi", 0.0, id="item_u1", transcript_confidence=1.0)
+    inference = FakeSession(line, chat("assistant", "Hello", 1.0), stt=SimpleNamespace(provider="livekit",
+                                                                                     model="deepgram/nova-3"))
+    direct = FakeSession(line, chat("assistant", "Hello", 1.0), stt=SimpleNamespace(provider="deepgram",
+                                                                                  model="nova-3"))
+
+    assert "confidence" not in (await ended_body(http, inference))["transcript"][0]
+    assert (await ended_body(http, direct))["transcript"][0]["confidence"] == 1.0
+
+
+async def test_a_nova_sonic_failure_on_the_monotonic_clock_keeps_its_time(http, monkeypatch):
+    # Nova Sonic stamps its errors on the monotonic clock: 3 s here is T0 + 3, as the clocks read T0 + 100 and 100
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0), llm=Realtime())
+    error = SimpleNamespace(type="realtime_model_error", timestamp=3.0, label="aws.realtime.RealtimeModel",
+                            error=RuntimeError("stream closed"), recoverable=True)
+    session._recorded_events = [SimpleNamespace(type="error", created_at=T0 + 3.4, error=error)]
+    body = await ended_body(http, session)
+
+    assert body["diagnostics"]["errors"] == [
+        {"step": "llm", "side": "agent", "start_ms": 3000, "message": "aws.realtime.RealtimeModel: stream closed",
+         "recovered": True},
     ]
 
 

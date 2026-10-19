@@ -9,6 +9,6 @@ from .prompt_sync import prompt_hash, prompt_ref, push_prompt
 from .test_data import attach_test_data
 from .webhook_handler import WebhookHandler, create_webhook_handler
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = ["WebhookHandler", "create_webhook_handler", "attach_test_data", "prompt_hash", "prompt_ref", "push_prompt"]
 

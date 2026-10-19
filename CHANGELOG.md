@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-19
+
+### Added
+- A realtime model's voice is sent as `configuration.tts` (its provider and model, with the voice).
+- `errors[].end_ms` for a failure LiveKit's retry recovered: when that step next worked. `errors[].side` is `agent` for LLM and TTS failures (STT stays `caller`).
+
+### Fixed
+- Realtime reply waits are sent only when the caller's stops are real: with a VAD on the session, or for models whose own speech detection reports them (OpenAI's realtime models, xAI's Grok). Nova Sonic and Gemini Live mark the caller stopped only once their reply starts (1–230 ms before it on recorded calls), so a wait from it would be the playback delay; Phonic and GPT Live are unverified. A reply whose response is found by provider ID pairs with the caller's last stop before that response was created and sends `turnLatency` and `modelLatency` (a `ttft` of 0 is a placeholder, no `modelLatency`); without the match, with the last stop before it started speaking, `turnLatency` alone.
+- Caller lines carry no `start_ms`/`end_ms` on a realtime model whose caller times are stand-ins (as above), instead of times that end when the reply starts.
+- Realtime records that share one request ID for the whole session (Nova Sonic's usage pieces, GPT Live's) become one LLM request per generation: a record with a new positive `ttft` starts one, the records before it are its input (the caller's audio, the prompt) and those carrying its `ttft` its output. On a Nova Sonic call that is one request per reply, with its start, its tokens (summing exactly to the session's) and what became of it; GPT Live's records hold no generation, so none. The empty record every realtime session opens with (no request ID, tokens or time to first token; it showed as a `stopped` or `spoken` request on every realtime call) is no request.
+- A retried failure is recovered unless the same step failed for good before it next worked. Before, a final failure late in the call marked every earlier retried failure of that step as unrecovered.
+- An LLM request's failure window runs to its end (a realtime response's duration from creation), not 1 s past its stamp.
+- A failure stamped on the monotonic clock (Nova Sonic's) is moved onto the wall clock, so its `start_ms` is no longer 0.
+- A realtime model's `configuration.interruptions` is `enabled` only: its own speech detection interrupts it, so LiveKit's duration and word gates don't apply.
+- `configuration.interruptions` is what the running agent uses (an Agent's `allow_interruptions` and `turn_handling` over the session's), as turn detection already was.
+- `usage.stt_audio_ms` is left out when it is 0 (OpenAI's realtime transcription bills tokens and reports no audio).
+- LiveKit Inference STT's stand-in confidence of 1.0 is left out, as it already was for realtime models.
+
 ## [0.3.0] - 2026-10-16
 
 ### Added
