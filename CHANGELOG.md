@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-10-16
 
 ### Added
 - Eval mode: `attach_test_data(ctx, session)`, called once per job before `session.start()`, sends the agent's own record of each SuperBryn test call to SuperBryn: `call.started` when the call is recognised, then `call.ended` with the transcript (LiveKit's expressive `<expr/>` markup removed from agent text), tool calls, per-reply latencies, the models that ran (the current agent's own STT/LLM/TTS over the session's, adapters and fallback lists unwrapped), turn detection and interruption settings as LiveKit resolved them, the tools offered (MCP toolsets included), token, audio and character usage, every LLM request (realtime responses included) with its start, its tokens and what became of its answer: spoken, cut off, not spoken, stopped or only a tool call, and every STT, LLM or TTS failure with whether LiveKit's retry saved it. The requests are read from the session's recorded events when the call ends, so nothing subscribes to the deprecated `metrics_collected`. No audio is sent.
