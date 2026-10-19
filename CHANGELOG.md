@@ -7,9 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A realtime model's voice is sent as `configuration.tts` (its provider and model, with the voice).
+- `errors[].end_ms` for a failure LiveKit's retry recovered: when that step next worked. `errors[].side` is `agent` for LLM and TTS failures (STT stays `caller`).
+
 ### Fixed
-- Realtime reply waits: each reply is paired with the caller's last stop before the agent started speaking, not before its response was created. Nova Sonic stamps a response while the caller is still talking, so its calls sent no `turn_latencies` at all. `turnLatency` is now sent for every reply that answers new caller speech; `modelLatency` only when the reply's response is found by provider ID, so it is left out for Nova Sonic, whose replies carry a LiveKit ID no response has.
+- Realtime reply waits. A reply whose response is found by provider ID (OpenAI, Gemini) is paired with the caller's last stop before that response was created, and sends `turnLatency` and `modelLatency`. Without that match, only a session with a VAD knows when the caller stopped: the reply pairs with the last stop before it started speaking and sends `turnLatency` alone. Otherwise nothing is sent: Nova Sonic marks the caller stopped only once its own reply starts, so a wait from it would be the playback delay alone.
+- Nova Sonic's usage pieces are no longer sent as one LLM request: they share one completionId for the whole session, so they are no per-request record. Its tokens still count in `usage`.
+- A retried failure is recovered unless the same step failed for good before it next worked. Before, a final failure late in the call marked every earlier retried failure of that step as unrecovered.
+- An LLM request's failure window runs to its end (a realtime response's duration from creation), not 1 s past its stamp.
 - A failure stamped on the monotonic clock (Nova Sonic's) is moved onto the wall clock, so its `start_ms` is no longer 0.
+- A realtime model's `configuration.interruptions` is `enabled` only: its own speech detection interrupts it, so LiveKit's duration and word gates don't apply.
+- `configuration.interruptions` is what the running agent uses (an Agent's `allow_interruptions` and `turn_handling` over the session's), as turn detection already was.
+- `usage.stt_audio_ms` is left out when it is 0 (OpenAI's realtime transcription bills tokens and reports no audio).
+- LiveKit Inference STT's stand-in confidence of 1.0 is left out, as it already was for realtime models.
 
 ## [0.3.0] - 2026-10-16
 
