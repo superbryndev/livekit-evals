@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Realtime reply waits: each reply is paired with the caller's last stop before the agent started speaking, not before its response was created. Nova Sonic stamps a response while the caller is still talking, so its calls sent no `turn_latencies` at all. `turnLatency` is now sent for every reply that answers new caller speech; `modelLatency` only when the reply's response is found by provider ID, so it is left out for Nova Sonic, whose replies carry a LiveKit ID no response has.
+- A failure stamped on the monotonic clock (Nova Sonic's) is moved onto the wall clock, so its `start_ms` is no longer 0.
+
 ## [0.3.0] - 2026-10-16
 
 ### Added

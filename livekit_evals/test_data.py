@@ -61,7 +61,7 @@ _MAX_LLM_REQUESTS = 2000
 _MAX_ERRORS = 500
 # An LLM error this long after a request's metrics were stamped still belongs to it.
 _FAILURE_SLACK_S = 1.0
-# A realtime response stamped before this (2001) is on the monotonic clock, as Nova Sonic stamps them.
+# A realtime response or error stamped before this (2001) is on the monotonic clock, as Nova Sonic stamps them.
 _EPOCH_FLOOR = 1e9
 # LiveKit marks the caller speaking a moment after the provider stamps the line's start.
 _SPEECH_SLACK_S = 0.25
@@ -796,9 +796,10 @@ def _caller_span(start: Any, end: Any, speech: list[tuple[float, Optional[float]
 
 def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: list[tuple[float, Any]],
                              speech: list[tuple[float, Optional[float]]]) -> list[dict[str, Any]]:
-    """Each realtime reply's wait from the caller stopping: modelLatency to the model's first audio, turnLatency to
-    when the agent started speaking. Its response is found by provider ID, else as the last one created before it;
-    a reply that answers no new caller speech (the greeting, a second reply) gets none."""
+    """Each realtime reply's wait from the caller's last stop before the agent started speaking: turnLatency to that
+    start, always; modelLatency to the model's first audio, only when the reply's response is found by provider ID
+    (Nova Sonic's never is, and its responses are stamped before the caller stops). A reply that answers no new caller
+    speech (the greeting, a second reply) gets none."""
     responses = [(start, m) for start, m in requests if _attr(m, "type") == "realtime_model_metrics"]
     by_id = {_attr(m, "request_id"): (start, m) for start, m in reversed(responses) if _attr(m, "request_id")}
     stops = [stopped for _, stopped in speech if stopped is not None]
@@ -811,23 +812,21 @@ def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: lis
         heard = metrics.get("started_speaking_at")
         if not _is_num(heard):
             continue
-        ids = metrics.get("provider_request_ids") or ()
-        response = (next((by_id[i] for i in ids if isinstance(i, str) and i in by_id), None)
-                    or next((r for r in reversed(responses) if r[0] <= heard), None))
-        created = response[0] if response else heard
-        stopped = next((t for t in reversed(stops) if t <= created), None)
+        stopped = next((t for t in reversed(stops) if t <= heard), None)
         if stopped is None or stopped in answered:
             continue
         answered.add(stopped)
+        ids = metrics.get("provider_request_ids") or ()
+        response = next((by_id[i] for i in ids if isinstance(i, str) and i in by_id), None)
         ttft = _attr(response[1], "ttft") if response else None
-        first_audio = created + ttft if _is_num(ttft) and ttft >= 0 else None
+        first_audio = response[0] + ttft if response and _is_num(ttft) and ttft >= 0 else None
         entry = _compact({
+            # None when the model's first audio came before the stop: no wait to report
             "modelLatency": _millis(first_audio - stopped) if first_audio is not None else None,
             "turnLatency": _millis(heard - stopped),
         })
-        if entry:
-            turn_id = _turn_id(item)
-            latencies.append({"turn_id": turn_id, **entry} if turn_id in turn_ids else entry)
+        turn_id = _turn_id(item)
+        latencies.append({"turn_id": turn_id, **entry} if turn_id in turn_ids else entry)
     return latencies[:_MAX_TURN_LATENCIES]
 
 
@@ -925,12 +924,17 @@ def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[A
 
 
 def _reported_errors(events: list[Any]) -> list[tuple[float, str, Any]]:
-    """The STT, LLM and TTS failures the session reported, oldest first, each with when it happened."""
+    """The STT, LLM and TTS failures the session reported, oldest first, each with when it happened. A failure
+    stamped on the monotonic clock (Nova Sonic's) is moved onto the wall clock, as its responses are."""
     found = []
+    clock = time.time() - time.monotonic()
     for event in events:
         error = _attr(event, "error") if _attr(event, "type") == "error" else None
         step = _ERROR_STEPS.get(_attr(error, "type"))
-        at = next((t for t in (_attr(error, "timestamp"), _attr(event, "created_at")) if _is_num(t) and t > 0), None)
+        stamp = _attr(error, "timestamp")
+        if _is_num(stamp) and 0 < stamp < _EPOCH_FLOOR:
+            stamp += clock
+        at = next((t for t in (stamp, _attr(event, "created_at")) if _is_num(t) and t > 0), None)
         if step is not None and at is not None:
             found.append((at, step, error))
     return sorted(found, key=lambda entry: entry[0])

@@ -923,7 +923,7 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
         heard("Anything else?", 5.5, "resp_2", id="item_a2"),
         chat("user", "No thanks", 7.0, id="item_u2", transcript_confidence=1.0,
              metrics={"started_speaking_at": T0 + 7.0}),
-        heard("Bye!", 8.1, id="item_a3"),  # no provider ID: its response is the last one created before it
+        heard("Bye!", 8.1, id="item_a3"),  # no provider ID: its wait counts, the model's part can't be told
         llm=Realtime())
     session._recorded_events = [
         rt_event("resp_0", T0 + 0.0, ttft=0.3),
@@ -938,7 +938,7 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
     # the greeting answers no caller speech, and a second reply in the same turn none either
     assert body["diagnostics"]["turn_latencies"] == [
         {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
-        {"turn_id": "item_a3", "modelLatency": 500, "turnLatency": 600},
+        {"turn_id": "item_a3", "turnLatency": 600},
     ]
     # a caller line ends when the caller stopped; LiveKit's stand-in confidence of 1.0 is left out
     assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
@@ -967,6 +967,27 @@ async def test_a_realtime_caller_line_stamped_after_the_caller_stopped_moves_bac
         {"id": "item_u1", "role": "user", "text": "Where is my order?", "start_ms": 1000, "end_ms": 2000},
     ]
     assert body["diagnostics"]["turn_latencies"] == [{"turn_id": "item_a1", "modelLatency": 650, "turnLatency": 800}]
+
+
+async def test_nova_sonic_replies_get_their_wait_though_responses_are_stamped_before_the_caller_stops(http,
+                                                                                                    monkeypatch):
+    # Nova Sonic stamps a response on the monotonic clock when the caller's audio starts coming in, marks the caller
+    # stopped only once its reply starts, and keeps a LiveKit ID on the reply that no response carries
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    session = FakeSession(
+        heard("Hello, Skyway Airlines.", 0.5, "lk_greet", id="item_greet"),
+        chat("user", "My flight got cancelled?", 1.0, id="item_u1", metrics={"started_speaking_at": T0 + 1.0}),
+        heard("Yes, I can rebook you.", 3.1, "lk_reply", id="item_a1"),
+        llm=Realtime())
+    session._recorded_events = [
+        rt_event("cmp_0", 0.1, ttft=0.2),  # monotonic 0.1 s is T0 + 0.1, as the clocks read T0 + 100 and 100
+        caller("speaking", 1.0),
+        rt_event("cmp_1", 1.2, ttft=0.6),  # while the caller is still talking
+        caller("listening", 2.9),
+    ]
+    body = await ended_body(http, session)
+
+    assert body["diagnostics"]["turn_latencies"] == [{"turn_id": "item_a1", "turnLatency": 200}]
 
 
 async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
@@ -1036,6 +1057,20 @@ async def test_pipeline_failures_are_sent_as_errors(http):
         {"step": "llm", "start_ms": 3000, "message": "openai.LLM: rate limited", "recovered": False},
         {"step": "llm", "start_ms": 4000, "message": "openai.LLM: rate limited", "recovered": False},
         {"step": "tts", "start_ms": 5000, "message": "cartesia.TTS: voice not found", "recovered": False},
+    ]
+
+
+async def test_a_nova_sonic_failure_on_the_monotonic_clock_keeps_its_time(http, monkeypatch):
+    # Nova Sonic stamps its errors on the monotonic clock: 3 s here is T0 + 3, as the clocks read T0 + 100 and 100
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0), llm=Realtime())
+    error = SimpleNamespace(type="realtime_model_error", timestamp=3.0, label="aws.realtime.RealtimeModel",
+                            error=RuntimeError("stream closed"), recoverable=True)
+    session._recorded_events = [SimpleNamespace(type="error", created_at=T0 + 3.4, error=error)]
+    body = await ended_body(http, session)
+
+    assert body["diagnostics"]["errors"] == [
+        {"step": "llm", "start_ms": 3000, "message": "aws.realtime.RealtimeModel: stream closed", "recovered": True},
     ]
 
 
