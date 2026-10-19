@@ -897,11 +897,13 @@ def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: lis
 
 
 def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
-    """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. These
-    realtime records are no responses: the empty one every session opens with (no request_id, tokens or ttft),
-    xAI's session-close record, Nova Sonic's (usage pieces on the monotonic clock), and any whose request_id repeats,
-    i.e. one ID for the whole session (Nova Sonic's completionId, GPT Live's); their tokens still count in usage."""
+    """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. The
+    empty realtime record every session opens with (no request_id, tokens or ttft) and xAI's session-close record are
+    no responses. Records that share one request ID for the whole session (Nova Sonic's usage pieces, on the
+    monotonic clock; GPT Live's) become one response per generation (_generations)."""
     log = []
+    shared: dict[Any, list[tuple[float, Any]]] = {}
+    clock = time.time() - time.monotonic()
     seen = Counter(_attr(_attr(e, "metrics"), "request_id") for e in events if _attr(e, "type") == "metrics_collected"
                    and _attr(_attr(e, "metrics"), "type") == "realtime_model_metrics")
     for event in events:
@@ -911,15 +913,57 @@ def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
             request_id = _attr(metrics, "request_id")
             empty = not request_id and not _request_tokens(metrics, True) and not (_is_num(_attr(metrics, "ttft"))
                                                                                   and _attr(metrics, "ttft") >= 0)
-            if (empty or request_id == "session_close" or (_is_num(stamp) and 0 < stamp < _EPOCH_FLOOR)
-                    or (request_id and seen[request_id] > 1)):
+            if empty or request_id == "session_close":
+                continue
+            monotonic = _is_num(stamp) and 0 < stamp < _EPOCH_FLOOR
+            if monotonic or (request_id and seen[request_id] > 1):
+                if _is_num(stamp) and stamp > 0:
+                    pieces = shared.setdefault(request_id or id(metrics), [])
+                    pieces.append((stamp + clock if monotonic else stamp, metrics))
                 continue
         if kind not in ("llm_metrics", "realtime_model_metrics") or not (_is_num(stamp) and stamp > 0):
             continue
         # an LLM request is stamped when it ends; a realtime response when it is created
         ended = kind == "llm_metrics" and _is_num(duration) and duration > 0
         log.append((stamp - duration if ended else stamp, metrics))
+    for request_id, pieces in shared.items():
+        log.extend(_generations(request_id, sorted(pieces, key=lambda piece: piece[0])))
     return sorted(log, key=lambda entry: entry[0])
+
+
+def _generations(request_id: Any, pieces: list[tuple[float, Any]]) -> list[tuple[float, Any]]:
+    """One realtime response per generation in records that share one request ID: a record with a new positive ttft
+    starts a generation, the records before it since the last one are its input (the caller's audio, the prompt),
+    and the records carrying its ttft are its output. Records after the last generation are no response; every
+    token still counts in usage. On a Nova Sonic call that is one response per reply, its tokens summing exactly to
+    the session's."""
+    generations: list[dict[str, Any]] = []
+    pending: list[Any] = []
+    for stamp, metrics in pieces:
+        ttft = _attr(metrics, "ttft")
+        if not (_is_num(ttft) and ttft > 0):
+            pending.append(metrics)
+            continue
+        if not generations or ttft != generations[-1]["ttft"]:
+            generations.append({"start": stamp, "ttft": ttft, "parts": pending})
+            pending = []
+        generations[-1]["parts"].append(metrics)
+        generations[-1]["end"] = stamp
+
+    def total(parts: list[Any], *path: str) -> int:
+        values = []
+        for part in parts:
+            for name in path:
+                part = _attr(part, name)
+            values.append(part)
+        return int(sum(v for v in values if _is_num(v) and v >= 0))
+
+    return [(g["start"], SimpleNamespace(
+        type="realtime_model_metrics", request_id=f"{request_id}:{n}", timestamp=g["start"],
+        duration=g["end"] - g["start"], ttft=g["ttft"], input_tokens=total(g["parts"], "input_tokens"),
+        output_tokens=total(g["parts"], "output_tokens"),
+        input_token_details=SimpleNamespace(cached_tokens=total(g["parts"], "input_token_details", "cached_tokens"))))
+        for n, g in enumerate(generations, 1)]
 
 
 def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[Any],

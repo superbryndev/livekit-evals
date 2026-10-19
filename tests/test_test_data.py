@@ -1106,19 +1106,58 @@ async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
     assert diagnostics["usage"] == {"llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400}
 
 
-async def test_nova_sonic_usage_pieces_and_xais_session_close_are_no_requests(http, monkeypatch):
-    # Nova Sonic stamps on the monotonic clock (100 s here, when the wall clock reads T0 + 100) and sends usage in
-    # pieces under one completionId for the whole session; xAI closes with a record of the session's length
+# Nova Sonic's 38 usage pieces from a recorded 2.5 Sonic call, one completionId for them all: (monotonic s, input
+# text, input audio, output text, output audio, ttft). A reply's output pieces carry one ttft, the caller's input none.
+NOVA_PIECES = [
+    (4.913, 22, 0, 0, 0, 0.0), (5.023, 0, 157, 0, 0, 0.0), (5.024, 1, 0, 0, 0, 0.0), (5.131, 12, 0, 0, 0, 0.0),
+    (5.134, 43, 0, 0, 0, 0.0), (5.172, 4, 0, 0, 0, 0.0), (5.275, 302, 0, 0, 0, 0.0), (5.551, 0, 0, 13, 0, 0.0),
+    (5.82, 0, 0, 2, 18, 0.0028848648071289062), (6.093, 0, 0, 0, 20, 0.0028848648071289062),
+    (6.678, 0, 0, 0, 20, 0.0028848648071289062), (20.617, 0, 100, 0, 0, 0.0), (20.618, 3, 0, 0, 0, 0.0),
+    (20.777, 0, 0, 15, 5, 0.0), (20.834, 0, 7, 0, 0, 0.0), (20.845, 3, 0, 0, 0, 0.0), (21.033, 0, 3, 0, 0, 0.0),
+    (21.033, 3, 0, 0, 0, 0.0), (21.055, 1, 0, 0, 0, 0.0), (21.591, 0, 0, 11, 0, 0.0),
+    (21.632, 0, 0, 6, 14, 0.0009641647338867188), (23.507, 0, 0, 0, 20, 0.0009641647338867188),
+    (24.755, 0, 0, 4, 16, 0.0009641647338867188), (31.756, 0, 81, 0, 0, 0.0), (31.756, 3, 0, 0, 0, 0.0),
+    (32.327, 0, 0, 12, 0, 0.0), (32.384, 0, 0, 15, 5, 0.0023860931396484375),
+    (32.798, 0, 0, 0, 20, 0.0023860931396484375), (33.228, 0, 0, 0, 20, 0.0023860931396484375),
+    (33.857, 0, 0, 0, 20, 0.0023860931396484375), (46.319, 0, 100, 0, 0, 0.0), (46.319, 3, 0, 0, 0, 0.0),
+    (46.445, 0, 0, 15, 5, 0.0), (46.956, 0, 17, 0, 0, 0.0), (46.956, 3, 0, 0, 0, 0.0), (46.974, 1, 0, 0, 0, 0.0),
+    (47.347, 0, 0, 11, 0, 0.0), (47.496, 0, 0, 7, 13, 0.0012772083282470703),
+]
+
+
+async def test_nova_sonic_usage_pieces_become_one_request_per_reply(http, monkeypatch):
+    # on the monotonic clock: 4.9 s is T0 + 4.9, as the clocks read T0 + 100 and 100
     monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
-    session = FakeSession(heard("Hello, Acme support.", 1.5), llm=Realtime())
+    session = FakeSession(
+        chat("user", "", 0.0),  # the session's start
+        heard("Hello, this is the Brief Voice AI model.", 7.29, "lk_greet"),
+        chat("user", "hello who are you and what model are you", 21.59),
+        heard("I am the Brief Voice AI model.", 21.80, "lk_reply_1"),
+        chat("user", "what are some things you can help me with", 32.34),
+        heard("I can answer questions and give brief replies.", 32.44, "lk_reply_2"),
+        chat("user", "can you tell me one interesting fact about space", 47.37),
+        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"))
     session._recorded_events = [
-        rt_event("cmp_1", 1.0, ttft=0.3, given=600, audio_in=550),
-        rt_event("cmp_1", 2.0, ttft=0.0, produced=180, audio_out=170),
-        rt_event("session_close", T0 + 9.0, ttft=-1, session_duration=95.5),
-    ]
+        rt_event("7316680d", at, ttft=ttft, duration=0.0, given=it + ia, produced=ot + oa, audio_in=ia, audio_out=oa)
+        for at, it, ia, ot, oa, ttft in NOVA_PIECES]
     diagnostics = (await ended_body(http, session))["diagnostics"]
 
-    assert "llm_requests" not in diagnostics
+    # 869 tokens in and 307 out, the session's; the call ended before the fourth reply was heard
+    assert diagnostics["llm_requests"] == [
+        {"start_ms": 5820, "outcome": "spoken", "input_tokens": 541, "cached_input_tokens": 0, "output_tokens": 73},
+        {"start_ms": 21632, "outcome": "spoken", "input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 91},
+        {"start_ms": 32384, "outcome": "spoken", "input_tokens": 84, "cached_input_tokens": 0, "output_tokens": 92},
+        {"start_ms": 47496, "outcome": "not_spoken", "input_tokens": 124, "cached_input_tokens": 0,
+         "output_tokens": 51},
+    ]
+
+
+async def test_xais_session_close_record_is_no_request(http):
+    # xAI closes with a record of the session's length, which it bills by
+    session = FakeSession(chat("user", "Hi", 0.0), heard("Hello, Acme support.", 1.5, "resp_1"), llm=Realtime())
+    session._recorded_events = [rt_event("session_close", T0 + 9.0, ttft=-1, session_duration=95.5)]
+
+    assert "llm_requests" not in (await ended_body(http, session))["diagnostics"]
 
 
 async def test_no_recorded_requests_sends_no_llm_requests(http):
