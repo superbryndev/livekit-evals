@@ -662,15 +662,29 @@ _REAL_CALLER_STOPS = ("gpt-realtime", "gpt-4o-realtime", "gpt-4o-mini-realtime",
 
 
 def _caller_times_real(session: Any) -> bool:
-    """Whether a realtime session's caller start and stop times are real: with a VAD on the session they are
-    LiveKit's own; without, only for the models in _REAL_CALLER_STOPS. Quietly False when the model can't be read."""
-    if _attr(session, "vad") is not None:
+    """Whether a realtime session's caller start and stop times are real: with a VAD the code gave the agent or the
+    session they are LiveKit's own; without, only for the models in _REAL_CALLER_STOPS. Quietly False when the model
+    can't be read."""
+    if _given_vad(session):
         return True
     try:
         model = (_component(session, "llm", []).get("model") or "").lower()
     except Exception:  # noqa: BLE001
         return False
     return any(name in model for name in _REAL_CALLER_STOPS)
+
+
+_UNSET = object()
+
+
+def _given_vad(session: Any) -> bool:
+    """Whether a VAD the code passed in runs, as LiveKit picks it: the agent's own when given, else the session's.
+    LiveKit 1.8 fills in a default VAD when none is passed (_using_default_vad), which realtime models with their own
+    turn detection never use, so that one doesn't count."""
+    agent_vad = getattr(_attr(session, "current_agent"), "vad", _UNSET)
+    if agent_vad is not _UNSET and type(agent_vad).__name__ != "NotGiven":
+        return agent_vad is not None
+    return _attr(session, "vad") is not None and not _attr(session, "_using_default_vad")
 
 
 def _inference_stt(session: Any) -> bool:
@@ -899,11 +913,10 @@ def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: lis
 def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
     """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. The
     empty realtime record every session opens with (no request_id, tokens or ttft) and xAI's session-close record are
-    no responses. Records that share one request ID for the whole session (Nova Sonic's usage pieces, on the
-    monotonic clock; GPT Live's) become one response per generation (_generations)."""
+    no responses. Neither are records that share one request ID for the whole session (Nova Sonic's usage pieces, on
+    the monotonic clock; GPT Live's): they are stamped as the reply's audio arrives, not when it was asked for, so
+    neither a request's start nor what became of it can be told. Their tokens still count in usage."""
     log = []
-    shared: dict[Any, list[tuple[float, Any]]] = {}
-    clock = time.time() - time.monotonic()
     seen = Counter(_attr(_attr(e, "metrics"), "request_id") for e in events if _attr(e, "type") == "metrics_collected"
                    and _attr(_attr(e, "metrics"), "type") == "realtime_model_metrics")
     for event in events:
@@ -913,57 +926,15 @@ def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
             request_id = _attr(metrics, "request_id")
             empty = not request_id and not _request_tokens(metrics, True) and not (_is_num(_attr(metrics, "ttft"))
                                                                                   and _attr(metrics, "ttft") >= 0)
-            if empty or request_id == "session_close":
-                continue
             monotonic = _is_num(stamp) and 0 < stamp < _EPOCH_FLOOR
-            if monotonic or (request_id and seen[request_id] > 1):
-                if _is_num(stamp) and stamp > 0:
-                    pieces = shared.setdefault(request_id or id(metrics), [])
-                    pieces.append((stamp + clock if monotonic else stamp, metrics))
+            if empty or request_id == "session_close" or monotonic or (request_id and seen[request_id] > 1):
                 continue
         if kind not in ("llm_metrics", "realtime_model_metrics") or not (_is_num(stamp) and stamp > 0):
             continue
         # an LLM request is stamped when it ends; a realtime response when it is created
         ended = kind == "llm_metrics" and _is_num(duration) and duration > 0
         log.append((stamp - duration if ended else stamp, metrics))
-    for request_id, pieces in shared.items():
-        log.extend(_generations(request_id, sorted(pieces, key=lambda piece: piece[0])))
     return sorted(log, key=lambda entry: entry[0])
-
-
-def _generations(request_id: Any, pieces: list[tuple[float, Any]]) -> list[tuple[float, Any]]:
-    """One realtime response per generation in records that share one request ID: a record with a new positive ttft
-    starts a generation, the records before it since the last one are its input (the caller's audio, the prompt),
-    and the records carrying its ttft are its output. Records after the last generation are no response; every
-    token still counts in usage. On a Nova Sonic call that is one response per reply, its tokens summing exactly to
-    the session's."""
-    generations: list[dict[str, Any]] = []
-    pending: list[Any] = []
-    for stamp, metrics in pieces:
-        ttft = _attr(metrics, "ttft")
-        if not (_is_num(ttft) and ttft > 0):
-            pending.append(metrics)
-            continue
-        if not generations or ttft != generations[-1]["ttft"]:
-            generations.append({"start": stamp, "ttft": ttft, "parts": pending})
-            pending = []
-        generations[-1]["parts"].append(metrics)
-        generations[-1]["end"] = stamp
-
-    def total(parts: list[Any], *path: str) -> int:
-        values = []
-        for part in parts:
-            for name in path:
-                part = _attr(part, name)
-            values.append(part)
-        return int(sum(v for v in values if _is_num(v) and v >= 0))
-
-    return [(g["start"], SimpleNamespace(
-        type="realtime_model_metrics", request_id=f"{request_id}:{n}", timestamp=g["start"],
-        duration=g["end"] - g["start"], ttft=g["ttft"], input_tokens=total(g["parts"], "input_tokens"),
-        output_tokens=total(g["parts"], "output_tokens"),
-        input_token_details=SimpleNamespace(cached_tokens=total(g["parts"], "input_token_details", "cached_tokens"))))
-        for n, g in enumerate(generations, 1)]
 
 
 def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[Any],
@@ -1097,12 +1068,18 @@ def _request_tokens(metrics: Any, realtime: bool) -> dict[str, int]:
 
 
 def _usage(usage: list[Any]) -> dict[str, int]:
-    """LLM token, STT audio and TTS character totals; a field only when entries of its type exist."""
+    """LLM token, STT audio and TTS character totals; a field only when entries of its type exist. A realtime model's
+    speech and text tokens, which are priced apart, are split out when it reports any speech tokens."""
     llms, stts, ttss = _of_type(usage, "llm_usage"), _of_type(usage, "stt_usage"), _of_type(usage, "tts_usage")
+    split = {key: _total(llms, field) for key, field in (
+        ("llm_input_audio_tokens", "input_audio_tokens"), ("llm_input_text_tokens", "input_text_tokens"),
+        ("llm_output_audio_tokens", "output_audio_tokens"), ("llm_output_text_tokens", "output_text_tokens"))}
+    speech = split["llm_input_audio_tokens"] or split["llm_output_audio_tokens"]
     return _compact({
         "llm_input_tokens": _total(llms, "input_tokens") if llms else None,
         "llm_cached_input_tokens": _total(llms, "input_cached_tokens") if llms else None,
         "llm_output_tokens": _total(llms, "output_tokens") if llms else None,
+        **(split if speech else {}),
         # OpenAI's realtime transcription bills tokens and reports 0 s of audio: 0 is no measure
         "stt_audio_ms": (_total(stts, "audio_duration", 1000) or None) if stts else None,
         "tts_characters": _total(ttss, "characters_count") if ttss else None,

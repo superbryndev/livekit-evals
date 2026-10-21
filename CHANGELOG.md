@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-21
+
+### Added
+- `usage` splits a realtime model's tokens into speech and text (`llm_input_audio_tokens`, `llm_input_text_tokens`, `llm_output_audio_tokens`, `llm_output_text_tokens`), which providers price apart. Sent only when the model reports speech tokens.
+
+### Changed
+- Nova Sonic sends no `llm_requests`. Its usage pieces share one request ID for the whole session and are stamped as each reply's audio arrives (within about 40 ms of the reply starting to play on staging calls), so neither a request's start nor what became of it can be told; 0.3.1's one-request-per-reply rebuild mislabelled spoken replies. Its tokens still count in `usage`. GPT Live, which also keeps one ID for the session, already sent none.
+
+### Fixed
+- A realtime model's caller times count as real only with a VAD the code passed to the agent or the session. LiveKit 1.8 gives every session a default VAD when none is passed, which realtime models with their own turn detection never run, so 0.3.1 sent Nova Sonic and Gemini Live calls reply waits of about 115 ms and placeholder caller line times. Those are left out again, as 0.3.1 meant.
+
 ## [0.3.1] - 2026-10-19
 
 ### Added

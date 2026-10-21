@@ -1001,6 +1001,31 @@ async def test_a_realtime_reply_with_a_vad_gets_its_wait_without_the_models_part
     assert diagnostics["turn_latencies"] == [{"turn_id": "item_a1", "turnLatency": 200}]
 
 
+async def test_livekits_default_vad_does_not_make_nova_caller_times_real(http, monkeypatch):
+    # LiveKit 1.8 gives every session a VAD when none is passed; realtime models never run it, so the stand-in stops
+    # stay stand-ins (staging Nova calls sent ~115 ms waits and placeholder caller times on 0.3.1)
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    body = await ended_body(http, nova_session(vad=object(), _using_default_vad=True))
+
+    assert "turn_latencies" not in body["diagnostics"]
+    assert body["transcript"][1] == {"id": "item_u1", "role": "user", "text": "My flight got cancelled?"}
+
+
+async def test_a_real_sessions_default_vad_is_not_a_given_one():  # real AgentSession, not started
+    nova = Realtime("amazon.nova-2-5-sonic", "Amazon")
+    assert test_data._caller_times_real(AgentSession(llm=nova)) is False
+    assert test_data._caller_times_real(AgentSession(llm=nova, vad=object())) is True
+    assert test_data._caller_times_real(AgentSession(llm=Realtime())) is True  # OpenAI's own stops are real
+
+
+def test_the_agents_own_vad_wins_over_the_sessions():
+    session = lambda agent, **kw: FakeSession(agent=agent, **kw)  # noqa: E731
+    assert test_data._given_vad(session(SimpleNamespace(vad=object()), vad=object(), _using_default_vad=True))
+    assert not test_data._given_vad(session(SimpleNamespace(vad=None), vad=object(), _using_default_vad=False))
+    assert test_data._given_vad(session(None, vad=object(), _using_default_vad=False))
+    assert not test_data._given_vad(session(None, vad=None))
+
+
 async def test_gemini_live_replies_found_by_id_still_get_no_wait_its_caller_stops_are_stand_ins(http):
     # Gemini Live's IDs match its responses, but LiveKit marks the caller stopped as its reply starts (1-230 ms
     # before it on recorded calls), so neither a wait nor caller times can be told
@@ -1103,7 +1128,11 @@ async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
         {"start_ms": 0, "outcome": "spoken", "input_tokens": 1200, "cached_input_tokens": 300, "output_tokens": 400},
         {"start_ms": 3000, "outcome": "stopped"},
     ]
-    assert diagnostics["usage"] == {"llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400}
+    # speech and text tokens are priced apart, so a realtime model's split is sent too
+    assert diagnostics["usage"] == {
+        "llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400,
+        "llm_input_audio_tokens": 1000, "llm_input_text_tokens": 200, "llm_output_audio_tokens": 350,
+        "llm_output_text_tokens": 50}
 
 
 # Nova Sonic's 38 usage pieces from a recorded 2.5 Sonic call, one completionId for them all: (monotonic s, input
@@ -1125,9 +1154,13 @@ NOVA_PIECES = [
 ]
 
 
-async def test_nova_sonic_usage_pieces_become_one_request_per_reply(http, monkeypatch):
-    # on the monotonic clock: 4.9 s is T0 + 4.9, as the clocks read T0 + 100 and 100
+async def test_nova_sonic_usage_pieces_are_no_requests_but_their_tokens_count(http, monkeypatch):
+    # its pieces are stamped as each reply's audio arrives (staging calls: within ~40 ms of the reply starting to
+    # play), so no request's start or outcome can be told; usage keeps the session's tokens and their split
     monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    usage = AgentSessionUsage(model_usage=[LLMModelUsage(
+        provider="Amazon", model="amazon.nova-2-5-sonic", input_tokens=869, input_audio_tokens=465,
+        input_text_tokens=404, output_tokens=307, output_audio_tokens=196, output_text_tokens=111)])
     session = FakeSession(
         chat("user", "", 0.0),  # the session's start
         heard("Hello, this is the Brief Voice AI model.", 7.29, "lk_greet"),
@@ -1136,20 +1169,25 @@ async def test_nova_sonic_usage_pieces_become_one_request_per_reply(http, monkey
         chat("user", "what are some things you can help me with", 32.34),
         heard("I can answer questions and give brief replies.", 32.44, "lk_reply_2"),
         chat("user", "can you tell me one interesting fact about space", 47.37),
-        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"))
+        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"), usage=usage)
     session._recorded_events = [
         rt_event("7316680d", at, ttft=ttft, duration=0.0, given=it + ia, produced=ot + oa, audio_in=ia, audio_out=oa)
         for at, it, ia, ot, oa, ttft in NOVA_PIECES]
     diagnostics = (await ended_body(http, session))["diagnostics"]
 
-    # 869 tokens in and 307 out, the session's; the call ended before the fourth reply was heard
-    assert diagnostics["llm_requests"] == [
-        {"start_ms": 5820, "outcome": "spoken", "input_tokens": 541, "cached_input_tokens": 0, "output_tokens": 73},
-        {"start_ms": 21632, "outcome": "spoken", "input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 91},
-        {"start_ms": 32384, "outcome": "spoken", "input_tokens": 84, "cached_input_tokens": 0, "output_tokens": 92},
-        {"start_ms": 47496, "outcome": "not_spoken", "input_tokens": 124, "cached_input_tokens": 0,
-         "output_tokens": 51},
-    ]
+    assert "llm_requests" not in diagnostics
+    assert diagnostics["usage"] == {
+        "llm_input_tokens": 869, "llm_cached_input_tokens": 0, "llm_output_tokens": 307,
+        "llm_input_audio_tokens": 465, "llm_input_text_tokens": 404, "llm_output_audio_tokens": 196,
+        "llm_output_text_tokens": 111}
+
+
+async def test_a_text_llms_usage_has_no_speech_split(http):
+    usage = AgentSessionUsage(model_usage=[LLMModelUsage(
+        provider="openai", model="gpt-4.1-mini", input_tokens=500, input_text_tokens=500, output_tokens=50)])
+    diagnostics = (await ended_body(http, FakeSession(usage=usage)))["diagnostics"]
+
+    assert diagnostics["usage"] == {"llm_input_tokens": 500, "llm_cached_input_tokens": 0, "llm_output_tokens": 50}
 
 
 async def test_xais_session_close_record_is_no_request(http):
