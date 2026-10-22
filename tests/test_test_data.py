@@ -1238,6 +1238,15 @@ async def test_pipeline_failures_are_sent_as_errors(http):
     ]
 
 
+async def test_no_failure_is_sent_as_an_empty_error_list_but_only_from_an_event_record(http):
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))
+    session._recorded_events = []  # LiveKit records every session event: none was a failure
+    assert (await ended_body(http, session))["diagnostics"]["errors"] == []
+
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))  # an SDK without an event record
+    assert "errors" not in ((await ended_body(http, session)).get("diagnostics") or {})  # can't say there were none
+
+
 async def test_a_retried_failure_recovered_when_its_step_worked_again_before_failing_for_good(http):
     session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))
     worked = SimpleNamespace(type="metrics_collected", metrics=SimpleNamespace(

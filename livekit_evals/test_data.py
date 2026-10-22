@@ -229,7 +229,8 @@ class _TestCall:
         self.sample()
         items = list(getattr(getattr(self.session, "history", None), "items", None) or [])
         # every event the session emitted, as its own session report reads them
-        events = list(_attr(self.session, "_recorded_events") or ())
+        recorded = _attr(self.session, "_recorded_events")
+        events = list(recorded or ())
         requests = _section("llm_requests", _request_log, events) or []
         # a realtime model hears the caller itself: when they talked comes from the session's user states
         speech = (_section("caller_speech", _caller_speech, events) or []
@@ -244,7 +245,8 @@ class _TestCall:
         closed = self.closed_at if self.closed_at is not None else time.time()
         transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times, closed, states)
         llm_requests = _section("llm_requests", _llm_requests, requests, events, items, base)
-        errors = _section("errors", _errors, events, base)
+        # failures come from the session's event record; an SDK without one can't say there were none
+        errors = _section("errors", _errors, events, base) if recorded is not None else None
         ended_reason = self.close_reason or (reason.strip() if isinstance(reason, str) else "")
         body = self._event("ended", **_compact({
             "ended_at": self._ended_at(),
@@ -623,8 +625,14 @@ def _diagnostics(session: Any, items: list[Any], transcript: list[dict[str, Any]
         "llm_requests": llm_requests,
         "errors": errors,
     }
-    diagnostics = {k: _strict_json(k, v) for k, v in diagnostics.items() if v}
-    return {k: v for k, v in diagnostics.items() if v} or None
+    diagnostics = {k: _strict_json(k, v) for k, v in diagnostics.items() if _kept(k, v)}
+    return {k: v for k, v in diagnostics.items() if _kept(k, v)} or None
+
+
+def _kept(name: str, value: Any) -> bool:
+    """A diagnostics section worth sending: anything non-empty, and an empty errors list, which says the session
+    reported no failure (an error capture that failed is None and stays out, so SuperBryn reads it as not sent)."""
+    return bool(value) or (name == "errors" and value == [])
 
 
 def _section(name: str, build: Callable[..., Any], *args: Any) -> Any:
