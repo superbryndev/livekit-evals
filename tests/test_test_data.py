@@ -1514,6 +1514,48 @@ async def test_ended_at_is_when_the_session_closed_not_the_later_shutdown(http):
     assert ended.body["ended_at"] == test_data._iso(hung_up)
 
 
+async def closed_body(http, session, closed_at):
+    """One test call whose session closed at closed_at; its call.ended body."""
+    ctx = ctx_with_test_id()
+    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    await recognised(ctx)
+    session.emit("close", CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED, created_at=closed_at))
+    await ctx.shutdown()
+    return http.posts("call.ended")[-1].body
+
+
+def last_caller_line(states, stopped_at, closed_at):
+    """A call whose last caller line ("No.", from 10 s) LiveKit stopped at stopped_at, with these caller states."""
+    session = FakeSession(
+        heard("Anything else I can help with?", 1.0),
+        chat("user", "No.", 10.0, metrics={"started_speaking_at": T0 + 10.0, "stopped_speaking_at": T0 + stopped_at}))
+    session._recorded_events = states
+    return session, T0 + closed_at
+
+
+async def test_a_caller_line_cut_by_the_hang_up_ends_where_the_caller_stopped(http):
+    # LiveKit ends a line the call cut off at the close: on staging a "No." ran 11.5 s for 0.7 s of speech
+    session, closed = last_caller_line([caller("speaking", 10.0), caller("listening", 10.7)], 21.5, 21.6)
+    line = (await closed_body(http, session, closed))["transcript"][1]
+
+    assert line["end_ms"] - line["start_ms"] == 700
+
+
+async def test_a_caller_still_talking_at_the_close_gets_no_end(http):
+    session, closed = last_caller_line([caller("speaking", 10.0)], 21.5, 21.6)
+    line = (await closed_body(http, session, closed))["transcript"][1]
+
+    assert "start_ms" in line and "end_ms" not in line
+
+
+async def test_a_last_caller_line_that_really_ran_to_the_close_keeps_its_end(http):
+    # "No." then the caller hung up: the voice detector's stop is within 2 s of LiveKit's end, which stands
+    session, closed = last_caller_line([caller("speaking", 10.0), caller("listening", 11.0)], 10.6, 11.5)
+    line = (await closed_body(http, session, closed))["transcript"][1]
+
+    assert line["end_ms"] - line["start_ms"] == 600
+
+
 async def test_ended_at_is_never_before_the_start(http):
     session = FakeSession()
     ctx = ctx_with_test_id()

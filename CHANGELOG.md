@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A realtime model's caller times count as real only with a VAD the code passed to the agent or the session. LiveKit 1.8 gives every session a default VAD when none is passed, which realtime models with their own turn detection never run, so 0.3.1 sent Nova Sonic and Gemini Live calls reply waits of about 115 ms and placeholder caller line times. Those are left out again, as 0.3.1 meant.
+- A caller line the hang-up cut off no longer runs to the call's end. LiveKit ends a caller line still open at the close at the close itself (on staging a one-word "No." ran 11.5 s for 0.7 s of speech, on 4 of 21 calls); such a line now ends where the voice detector saw the caller stop, and has no `end_ms` when the caller was still talking at the close.
 
 ## [0.3.1] - 2026-10-19
 

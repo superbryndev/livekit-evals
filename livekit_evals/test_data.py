@@ -66,6 +66,8 @@ _FAILURE_SLACK_S = 1.0
 _EPOCH_FLOOR = 1e9
 # LiveKit marks the caller speaking a moment after the provider stamps the line's start.
 _SPEECH_SLACK_S = 0.25
+# A caller line still open when the session closed is ended at the close by LiveKit; one ending this near it is checked.
+_CLOSE_SLACK_S = 2.0
 _MAX_ERROR_MESSAGE = 1000
 # LiveKit's error types by pipeline step; a realtime model is the LLM step
 _ERROR_STEPS = {"stt_error": "stt", "llm_error": "llm", "tts_error": "tts", "realtime_model_error": "llm"}
@@ -237,7 +239,10 @@ class _TestCall:
         stand_in = _inference_stt(self.session)
         # a realtime model that marks the caller stopped only once its reply starts has no real caller times
         caller_times = speech is None or _caller_times_real(self.session)
-        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times)
+        # the caller's turns from the session's user states, for a caller line LiveKit ended at the close
+        states = speech if speech is not None else (_section("caller_speech", _caller_speech, events) or [])
+        closed = self.closed_at if self.closed_at is not None else time.time()
+        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times, closed, states)
         llm_requests = _section("llm_requests", _llm_requests, requests, events, items, base)
         errors = _section("errors", _errors, events, base)
         ended_reason = self.close_reason or (reason.strip() if isinstance(reason, str) else "")
@@ -512,11 +517,14 @@ def _time_base(items: list[Any], starts: Iterable[float] = ()) -> float:
 
 def _history_payload(items: list[Any], base: Optional[float] = None,
                      speech: Optional[list[tuple[float, Optional[float]]]] = None, stand_in_confidence: bool = False,
-                     caller_times: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                     caller_times: bool = True, closed_at: Optional[float] = None,
+                     caller_states: Optional[list[tuple[float, Optional[float]]]] = None,
+                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Contract turns and tool calls from the history items; ms are from base (by default the history's first moment).
     speech is set for a realtime model: caller lines take their times from it. LiveKit's 1.0 stand-in confidence is
     left out for a realtime model and when stand_in_confidence is set (LiveKit Inference STT). Without caller_times
-    (a realtime model whose caller times are stand-ins), caller lines carry no times."""
+    (a realtime model whose caller times are stand-ins), caller lines carry no times. A caller line ending near
+    closed_at is checked against caller_states (_stop_before_close)."""
     if base is None:
         base = _time_base(items)
 
@@ -541,6 +549,8 @@ def _history_payload(items: list[Any], base: Optional[float] = None,
                 end = metrics.get("stopped_speaking_at")
                 if user and speech is not None:
                     start, end = _caller_span(start, end, speech) if caller_times else (None, None)
+                if user and _is_num(closed_at) and _is_num(end) and abs(closed_at - end) <= _CLOSE_SLACK_S:
+                    end = _stop_before_close(start, end, caller_states or [])
                 if user and (speech is not None or stand_in_confidence) and confidence == 1.0:
                     confidence = None
                 transcript.append(_compact({
@@ -854,6 +864,17 @@ def _caller_speech(events: list[Any]) -> list[tuple[float, Optional[float]]]:
     if started is not None:
         spans.append((started, None))
     return spans
+
+
+def _stop_before_close(start: Any, end: float, states: list[tuple[float, Optional[float]]]) -> Optional[float]:
+    """A caller line ending at the session close: LiveKit ends a line the call cut off at the close itself, so it ends
+    where the voice detector saw its last speech stop instead (a staging "No." ran 11.5 s, not 0.7 s). Still talking
+    at the close, or nothing heard: no end rather than the close. A line whose speech really ran to the close keeps it."""
+    spans = [s for s in states if s[0] <= end and (s[1] is None or not _is_num(start) or s[1] > start - _SPEECH_SLACK_S)]
+    stop = spans[-1][1] if spans else None
+    if stop is None:
+        return None
+    return stop if end - stop > _CLOSE_SLACK_S else end
 
 
 def _caller_span(start: Any, end: Any, speech: list[tuple[float, Optional[float]]]) -> tuple[Any, Any]:
