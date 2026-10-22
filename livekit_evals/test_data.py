@@ -66,6 +66,8 @@ _FAILURE_SLACK_S = 1.0
 _EPOCH_FLOOR = 1e9
 # LiveKit marks the caller speaking a moment after the provider stamps the line's start.
 _SPEECH_SLACK_S = 0.25
+# A caller line still open when the session closed is ended at the close by LiveKit; one ending this near it is checked.
+_CLOSE_SLACK_S = 2.0
 _MAX_ERROR_MESSAGE = 1000
 # LiveKit's error types by pipeline step; a realtime model is the LLM step
 _ERROR_STEPS = {"stt_error": "stt", "llm_error": "llm", "tts_error": "tts", "realtime_model_error": "llm"}
@@ -227,7 +229,8 @@ class _TestCall:
         self.sample()
         items = list(getattr(getattr(self.session, "history", None), "items", None) or [])
         # every event the session emitted, as its own session report reads them
-        events = list(_attr(self.session, "_recorded_events") or ())
+        recorded = _attr(self.session, "_recorded_events")
+        events = list(recorded or ())
         requests = _section("llm_requests", _request_log, events) or []
         # a realtime model hears the caller itself: when they talked comes from the session's user states
         speech = (_section("caller_speech", _caller_speech, events) or []
@@ -237,9 +240,13 @@ class _TestCall:
         stand_in = _inference_stt(self.session)
         # a realtime model that marks the caller stopped only once its reply starts has no real caller times
         caller_times = speech is None or _caller_times_real(self.session)
-        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times)
+        # the caller's turns from the session's user states, for a caller line LiveKit ended at the close
+        states = speech if speech is not None else (_section("caller_speech", _caller_speech, events) or [])
+        closed = self.closed_at if self.closed_at is not None else time.time()
+        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times, closed, states)
         llm_requests = _section("llm_requests", _llm_requests, requests, events, items, base)
-        errors = _section("errors", _errors, events, base)
+        # failures come from the session's event record; an SDK without one can't say there were none
+        errors = _section("errors", _errors, events, base) if recorded is not None else None
         ended_reason = self.close_reason or (reason.strip() if isinstance(reason, str) else "")
         body = self._event("ended", **_compact({
             "ended_at": self._ended_at(),
@@ -512,11 +519,14 @@ def _time_base(items: list[Any], starts: Iterable[float] = ()) -> float:
 
 def _history_payload(items: list[Any], base: Optional[float] = None,
                      speech: Optional[list[tuple[float, Optional[float]]]] = None, stand_in_confidence: bool = False,
-                     caller_times: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                     caller_times: bool = True, closed_at: Optional[float] = None,
+                     caller_states: Optional[list[tuple[float, Optional[float]]]] = None,
+                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Contract turns and tool calls from the history items; ms are from base (by default the history's first moment).
     speech is set for a realtime model: caller lines take their times from it. LiveKit's 1.0 stand-in confidence is
     left out for a realtime model and when stand_in_confidence is set (LiveKit Inference STT). Without caller_times
-    (a realtime model whose caller times are stand-ins), caller lines carry no times."""
+    (a realtime model whose caller times are stand-ins), caller lines carry no times. A caller line ending near
+    closed_at is checked against caller_states (_stop_before_close)."""
     if base is None:
         base = _time_base(items)
 
@@ -541,6 +551,8 @@ def _history_payload(items: list[Any], base: Optional[float] = None,
                 end = metrics.get("stopped_speaking_at")
                 if user and speech is not None:
                     start, end = _caller_span(start, end, speech) if caller_times else (None, None)
+                if user and _is_num(closed_at) and _is_num(end) and abs(closed_at - end) <= _CLOSE_SLACK_S:
+                    end = _stop_before_close(start, end, caller_states or [])
                 if user and (speech is not None or stand_in_confidence) and confidence == 1.0:
                     confidence = None
                 transcript.append(_compact({
@@ -613,8 +625,14 @@ def _diagnostics(session: Any, items: list[Any], transcript: list[dict[str, Any]
         "llm_requests": llm_requests,
         "errors": errors,
     }
-    diagnostics = {k: _strict_json(k, v) for k, v in diagnostics.items() if v}
-    return {k: v for k, v in diagnostics.items() if v} or None
+    diagnostics = {k: _strict_json(k, v) for k, v in diagnostics.items() if _kept(k, v)}
+    return {k: v for k, v in diagnostics.items() if _kept(k, v)} or None
+
+
+def _kept(name: str, value: Any) -> bool:
+    """A diagnostics section worth sending: anything non-empty, and an empty errors list, which says the session
+    reported no failure (an error capture that failed is None and stays out, so SuperBryn reads it as not sent)."""
+    return bool(value) or (name == "errors" and value == [])
 
 
 def _section(name: str, build: Callable[..., Any], *args: Any) -> Any:
@@ -662,15 +680,29 @@ _REAL_CALLER_STOPS = ("gpt-realtime", "gpt-4o-realtime", "gpt-4o-mini-realtime",
 
 
 def _caller_times_real(session: Any) -> bool:
-    """Whether a realtime session's caller start and stop times are real: with a VAD on the session they are
-    LiveKit's own; without, only for the models in _REAL_CALLER_STOPS. Quietly False when the model can't be read."""
-    if _attr(session, "vad") is not None:
+    """Whether a realtime session's caller start and stop times are real: with a VAD the code gave the agent or the
+    session they are LiveKit's own; without, only for the models in _REAL_CALLER_STOPS. Quietly False when the model
+    can't be read."""
+    if _given_vad(session):
         return True
     try:
         model = (_component(session, "llm", []).get("model") or "").lower()
     except Exception:  # noqa: BLE001
         return False
     return any(name in model for name in _REAL_CALLER_STOPS)
+
+
+_UNSET = object()
+
+
+def _given_vad(session: Any) -> bool:
+    """Whether a VAD the code passed in runs, as LiveKit picks it: the agent's own when given, else the session's.
+    LiveKit 1.8 fills in a default VAD when none is passed (_using_default_vad), which realtime models with their own
+    turn detection never use, so that one doesn't count."""
+    agent_vad = getattr(_attr(session, "current_agent"), "vad", _UNSET)
+    if agent_vad is not _UNSET and type(agent_vad).__name__ != "NotGiven":
+        return agent_vad is not None
+    return _attr(session, "vad") is not None and not _attr(session, "_using_default_vad")
 
 
 def _inference_stt(session: Any) -> bool:
@@ -716,11 +748,21 @@ def _turn_detection(options: Any) -> dict[str, Any]:
     if isinstance(handling, dict):
         detector, endpointing = handling.get("turn_detection"), handling.get("endpointing") or {}
         min_s, max_s = endpointing.get("min_delay"), endpointing.get("max_delay")
+        preemptive = handling.get("preemptive_generation")
     else:
         detector = None
         min_s, max_s = _attr(options, "min_endpointing_delay"), _attr(options, "max_endpointing_delay")
+        preemptive = _attr(options, "preemptive_generation")
     return _compact({"type": _detector_name(detector), "min_end_of_turn_ms": _millis(min_s),
-                     "max_end_of_turn_ms": _millis(max_s)})
+                     "max_end_of_turn_ms": _millis(max_s), "preemptive_generation": _preemptive(preemptive)})
+
+
+def _preemptive(value: Any) -> Optional[bool]:
+    """Whether LiveKit drafts a reply before the caller's turn is confirmed (and drops it if they go on): a bool before
+    1.8, then turn_handling's options, whose "enabled" says it."""
+    if isinstance(value, dict):
+        value = value.get("enabled")
+    return value if isinstance(value, bool) else None
 
 
 def _live_turn_detection(activity: Any) -> Optional[dict[str, Any]]:
@@ -734,9 +776,13 @@ def _live_turn_detection(activity: Any) -> Optional[dict[str, Any]]:
         realtime = isinstance(model, llm.RealtimeModel) and _attr(_attr(model, "capabilities"), "turn_detection") is True
     if realtime:  # the realtime model decides when the caller finished: no endpointing delays apply
         return {"type": "realtime_llm"}
+    # the agent's preemptive setting over the session's from 1.8; before, only the session's options carry it
+    preemptive = _attr(activity, "preemptive_generation_opts") or _attr(_attr(_attr(activity, "_session"), "options"),
+                                                                        "preemptive_generation")
     return _compact({"type": _detector_name(_attr(activity, "_turn_detection")),
                      "min_end_of_turn_ms": _millis(_attr(activity, "min_endpointing_delay")),
-                     "max_end_of_turn_ms": _millis(_attr(activity, "max_endpointing_delay"))})
+                     "max_end_of_turn_ms": _millis(_attr(activity, "max_endpointing_delay")),
+                     "preemptive_generation": _preemptive(preemptive)})
 
 
 def _detector_name(detector: Any) -> Optional[str]:
@@ -842,6 +888,17 @@ def _caller_speech(events: list[Any]) -> list[tuple[float, Optional[float]]]:
     return spans
 
 
+def _stop_before_close(start: Any, end: float, states: list[tuple[float, Optional[float]]]) -> Optional[float]:
+    """A caller line ending at the session close: LiveKit ends a line the call cut off at the close itself, so it ends
+    where the voice detector saw its last speech stop instead (a staging "No." ran 11.5 s, not 0.7 s). Still talking
+    at the close, or nothing heard: no end rather than the close. A line whose speech really ran to the close keeps it."""
+    spans = [s for s in states if s[0] <= end and (s[1] is None or not _is_num(start) or s[1] > start - _SPEECH_SLACK_S)]
+    stop = spans[-1][1] if spans else None
+    if stop is None:
+        return None
+    return stop if end - stop > _CLOSE_SLACK_S else end
+
+
 def _caller_span(start: Any, end: Any, speech: list[tuple[float, Optional[float]]]) -> tuple[Any, Any]:
     """A realtime caller line's (start, end): the end is when its speech stopped, and a line stamped after the caller
     had already stopped (Gemini stamps its reply's start) moves back to when that speech started."""
@@ -899,11 +956,10 @@ def _realtime_turn_latencies(items: list[Any], turn_ids: set[str], requests: lis
 def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
     """(start time, metrics) of each LLM request and realtime response the session recorded, earliest first. The
     empty realtime record every session opens with (no request_id, tokens or ttft) and xAI's session-close record are
-    no responses. Records that share one request ID for the whole session (Nova Sonic's usage pieces, on the
-    monotonic clock; GPT Live's) become one response per generation (_generations)."""
+    no responses. Neither are records that share one request ID for the whole session (Nova Sonic's usage pieces, on
+    the monotonic clock; GPT Live's): they are stamped as the reply's audio arrives, not when it was asked for, so
+    neither a request's start nor what became of it can be told. Their tokens still count in usage."""
     log = []
-    shared: dict[Any, list[tuple[float, Any]]] = {}
-    clock = time.time() - time.monotonic()
     seen = Counter(_attr(_attr(e, "metrics"), "request_id") for e in events if _attr(e, "type") == "metrics_collected"
                    and _attr(_attr(e, "metrics"), "type") == "realtime_model_metrics")
     for event in events:
@@ -913,57 +969,15 @@ def _request_log(events: list[Any]) -> list[tuple[float, Any]]:
             request_id = _attr(metrics, "request_id")
             empty = not request_id and not _request_tokens(metrics, True) and not (_is_num(_attr(metrics, "ttft"))
                                                                                   and _attr(metrics, "ttft") >= 0)
-            if empty or request_id == "session_close":
-                continue
             monotonic = _is_num(stamp) and 0 < stamp < _EPOCH_FLOOR
-            if monotonic or (request_id and seen[request_id] > 1):
-                if _is_num(stamp) and stamp > 0:
-                    pieces = shared.setdefault(request_id or id(metrics), [])
-                    pieces.append((stamp + clock if monotonic else stamp, metrics))
+            if empty or request_id == "session_close" or monotonic or (request_id and seen[request_id] > 1):
                 continue
         if kind not in ("llm_metrics", "realtime_model_metrics") or not (_is_num(stamp) and stamp > 0):
             continue
         # an LLM request is stamped when it ends; a realtime response when it is created
         ended = kind == "llm_metrics" and _is_num(duration) and duration > 0
         log.append((stamp - duration if ended else stamp, metrics))
-    for request_id, pieces in shared.items():
-        log.extend(_generations(request_id, sorted(pieces, key=lambda piece: piece[0])))
     return sorted(log, key=lambda entry: entry[0])
-
-
-def _generations(request_id: Any, pieces: list[tuple[float, Any]]) -> list[tuple[float, Any]]:
-    """One realtime response per generation in records that share one request ID: a record with a new positive ttft
-    starts a generation, the records before it since the last one are its input (the caller's audio, the prompt),
-    and the records carrying its ttft are its output. Records after the last generation are no response; every
-    token still counts in usage. On a Nova Sonic call that is one response per reply, its tokens summing exactly to
-    the session's."""
-    generations: list[dict[str, Any]] = []
-    pending: list[Any] = []
-    for stamp, metrics in pieces:
-        ttft = _attr(metrics, "ttft")
-        if not (_is_num(ttft) and ttft > 0):
-            pending.append(metrics)
-            continue
-        if not generations or ttft != generations[-1]["ttft"]:
-            generations.append({"start": stamp, "ttft": ttft, "parts": pending})
-            pending = []
-        generations[-1]["parts"].append(metrics)
-        generations[-1]["end"] = stamp
-
-    def total(parts: list[Any], *path: str) -> int:
-        values = []
-        for part in parts:
-            for name in path:
-                part = _attr(part, name)
-            values.append(part)
-        return int(sum(v for v in values if _is_num(v) and v >= 0))
-
-    return [(g["start"], SimpleNamespace(
-        type="realtime_model_metrics", request_id=f"{request_id}:{n}", timestamp=g["start"],
-        duration=g["end"] - g["start"], ttft=g["ttft"], input_tokens=total(g["parts"], "input_tokens"),
-        output_tokens=total(g["parts"], "output_tokens"),
-        input_token_details=SimpleNamespace(cached_tokens=total(g["parts"], "input_token_details", "cached_tokens"))))
-        for n, g in enumerate(generations, 1)]
 
 
 def _llm_requests(log: list[tuple[float, Any]], events: list[Any], items: list[Any],
@@ -1097,12 +1111,18 @@ def _request_tokens(metrics: Any, realtime: bool) -> dict[str, int]:
 
 
 def _usage(usage: list[Any]) -> dict[str, int]:
-    """LLM token, STT audio and TTS character totals; a field only when entries of its type exist."""
+    """LLM token, STT audio and TTS character totals; a field only when entries of its type exist. A realtime model's
+    speech and text tokens, which are priced apart, are split out when it reports any speech tokens."""
     llms, stts, ttss = _of_type(usage, "llm_usage"), _of_type(usage, "stt_usage"), _of_type(usage, "tts_usage")
+    split = {key: _total(llms, field) for key, field in (
+        ("llm_input_audio_tokens", "input_audio_tokens"), ("llm_input_text_tokens", "input_text_tokens"),
+        ("llm_output_audio_tokens", "output_audio_tokens"), ("llm_output_text_tokens", "output_text_tokens"))}
+    speech = split["llm_input_audio_tokens"] or split["llm_output_audio_tokens"]
     return _compact({
         "llm_input_tokens": _total(llms, "input_tokens") if llms else None,
         "llm_cached_input_tokens": _total(llms, "input_cached_tokens") if llms else None,
         "llm_output_tokens": _total(llms, "output_tokens") if llms else None,
+        **(split if speech else {}),
         # OpenAI's realtime transcription bills tokens and reports 0 s of audio: 0 is no measure
         "stt_audio_ms": (_total(stts, "audio_duration", 1000) or None) if stts else None,
         "tts_characters": _total(ttss, "characters_count") if ttss else None,

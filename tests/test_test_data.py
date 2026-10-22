@@ -684,6 +684,7 @@ async def test_configuration_from_turn_handling(http):
             "turn_detection": NamedDetector(),
             "endpointing": {"mode": "fixed", "min_delay": 0.3, "max_delay": 2.5, "alpha": 0.9},
             "interruption": {"enabled": True, "min_duration": 0.5, "min_words": 0, "mode": "adaptive"},
+            "preemptive_generation": {"enabled": False, "preemptive_tts": False, "max_retries": 3},
         }),
     )
     diagnostics = (await ended_body(http, session))["diagnostics"]
@@ -693,7 +694,8 @@ async def test_configuration_from_turn_handling(http):
         "stt": {"provider": "deepgram", "model": "nova-3"},
         "llm": {"provider": "openai", "model": "gpt-4.1"},
         "tts": {"provider": "cartesia", "model": "sonic-2", "voice": "voice-id"},
-        "turn_detection": {"type": "turn-detector-v1-mini", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500},
+        "turn_detection": {"type": "turn-detector-v1-mini", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500,
+                           "preemptive_generation": False},
         "interruptions": {"enabled": True, "min_duration_ms": 500, "min_words": 0},
     }
 
@@ -712,7 +714,7 @@ async def test_configuration_from_older_options_and_usage(http):
         llm=SimpleNamespace(provider="unknown", model="unknown"),  # a custom LLM that names neither
         tts=SimpleNamespace(provider="elevenlabs", model="", voice_id="voice-1"),
         options=SimpleNamespace(min_endpointing_delay=0.4, max_endpointing_delay=5.0, allow_interruptions=False,
-                                min_interruption_duration=0.7, min_interruption_words=2),
+                                min_interruption_duration=0.7, min_interruption_words=2, preemptive_generation=True),
         usage=AgentSessionUsage(model_usage=[
             LLMModelUsage(provider="", model=""),
             LLMModelUsage(provider="openai", model="gpt-4.1-mini"),
@@ -724,7 +726,7 @@ async def test_configuration_from_older_options_and_usage(http):
     assert configuration == {
         "llm": {"provider": "openai", "model": "gpt-4.1-mini"},
         "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5", "voice": "voice-1"},
-        "turn_detection": {"min_end_of_turn_ms": 400, "max_end_of_turn_ms": 5000},
+        "turn_detection": {"min_end_of_turn_ms": 400, "max_end_of_turn_ms": 5000, "preemptive_generation": True},
         "interruptions": {"enabled": False, "min_duration_ms": 700, "min_words": 2},
     }
 
@@ -779,12 +781,13 @@ async def test_live_turn_detection_is_what_livekit_resolved():  # real AgentSess
     stt = SimpleNamespace(capabilities=SimpleNamespace(streaming=True, aligned_transcript=False))
     session = AgentSession(stt=stt, vad=None,
                            turn_handling={"turn_detection": "stt", "endpointing": {"min_delay": 0.4}})
+    # LiveKit drafts replies early unless told not to
     assert test_data._live_turn_detection(AgentActivity(Agent(instructions="x"), session)) == {
-        "type": "stt", "min_end_of_turn_ms": 400, "max_end_of_turn_ms": 3000}
-    agent = Agent(instructions="x", turn_handling={"turn_detection": "manual",
+        "type": "stt", "min_end_of_turn_ms": 400, "max_end_of_turn_ms": 3000, "preemptive_generation": True}
+    agent = Agent(instructions="x", turn_handling={"turn_detection": "manual", "preemptive_generation": {"enabled": False},
                                                    "endpointing": {"min_delay": 1.2, "max_delay": 4.0}})
     assert test_data._live_turn_detection(AgentActivity(agent, session)) == {
-        "type": "manual", "min_end_of_turn_ms": 1200, "max_end_of_turn_ms": 4000}
+        "type": "manual", "min_end_of_turn_ms": 1200, "max_end_of_turn_ms": 4000, "preemptive_generation": False}
 
     assert test_data._live_turn_detection(None) is None
     assert test_data._live_turn_detection(SimpleNamespace(_turn_detection="vad")) is None  # another SDK shape
@@ -796,6 +799,8 @@ async def test_live_turn_detection_before_1_8():  # an AgentActivity without _rt
     assert test_data._live_turn_detection(older) == {"min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
     older._turn_detection = "vad"
     assert test_data._live_turn_detection(older) == {"type": "vad", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
+    older._session = SimpleNamespace(options=SimpleNamespace(preemptive_generation=False))  # a bool on the session
+    assert test_data._live_turn_detection(older)["preemptive_generation"] is False
     older.llm = Realtime()  # server-side turn detection takes the turns
     assert test_data._live_turn_detection(older) == {"type": "realtime_llm"}
 
@@ -1001,6 +1006,31 @@ async def test_a_realtime_reply_with_a_vad_gets_its_wait_without_the_models_part
     assert diagnostics["turn_latencies"] == [{"turn_id": "item_a1", "turnLatency": 200}]
 
 
+async def test_livekits_default_vad_does_not_make_nova_caller_times_real(http, monkeypatch):
+    # LiveKit 1.8 gives every session a VAD when none is passed; realtime models never run it, so the stand-in stops
+    # stay stand-ins (staging Nova calls sent ~115 ms waits and placeholder caller times on 0.3.1)
+    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    body = await ended_body(http, nova_session(vad=object(), _using_default_vad=True))
+
+    assert "turn_latencies" not in body["diagnostics"]
+    assert body["transcript"][1] == {"id": "item_u1", "role": "user", "text": "My flight got cancelled?"}
+
+
+async def test_a_real_sessions_default_vad_is_not_a_given_one():  # real AgentSession, not started
+    nova = Realtime("amazon.nova-2-5-sonic", "Amazon")
+    assert test_data._caller_times_real(AgentSession(llm=nova)) is False
+    assert test_data._caller_times_real(AgentSession(llm=nova, vad=object())) is True
+    assert test_data._caller_times_real(AgentSession(llm=Realtime())) is True  # OpenAI's own stops are real
+
+
+def test_the_agents_own_vad_wins_over_the_sessions():
+    session = lambda agent, **kw: FakeSession(agent=agent, **kw)  # noqa: E731
+    assert test_data._given_vad(session(SimpleNamespace(vad=object()), vad=object(), _using_default_vad=True))
+    assert not test_data._given_vad(session(SimpleNamespace(vad=None), vad=object(), _using_default_vad=False))
+    assert test_data._given_vad(session(None, vad=object(), _using_default_vad=False))
+    assert not test_data._given_vad(session(None, vad=None))
+
+
 async def test_gemini_live_replies_found_by_id_still_get_no_wait_its_caller_stops_are_stand_ins(http):
     # Gemini Live's IDs match its responses, but LiveKit marks the caller stopped as its reply starts (1-230 ms
     # before it on recorded calls), so neither a wait nor caller times can be told
@@ -1103,7 +1133,11 @@ async def test_realtime_responses_and_usage_fill_only_the_existing_fields(http):
         {"start_ms": 0, "outcome": "spoken", "input_tokens": 1200, "cached_input_tokens": 300, "output_tokens": 400},
         {"start_ms": 3000, "outcome": "stopped"},
     ]
-    assert diagnostics["usage"] == {"llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400}
+    # speech and text tokens are priced apart, so a realtime model's split is sent too
+    assert diagnostics["usage"] == {
+        "llm_input_tokens": 1200, "llm_cached_input_tokens": 300, "llm_output_tokens": 400,
+        "llm_input_audio_tokens": 1000, "llm_input_text_tokens": 200, "llm_output_audio_tokens": 350,
+        "llm_output_text_tokens": 50}
 
 
 # Nova Sonic's 38 usage pieces from a recorded 2.5 Sonic call, one completionId for them all: (monotonic s, input
@@ -1125,9 +1159,13 @@ NOVA_PIECES = [
 ]
 
 
-async def test_nova_sonic_usage_pieces_become_one_request_per_reply(http, monkeypatch):
-    # on the monotonic clock: 4.9 s is T0 + 4.9, as the clocks read T0 + 100 and 100
+async def test_nova_sonic_usage_pieces_are_no_requests_but_their_tokens_count(http, monkeypatch):
+    # its pieces are stamped as each reply's audio arrives (staging calls: within ~40 ms of the reply starting to
+    # play), so no request's start or outcome can be told; usage keeps the session's tokens and their split
     monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    usage = AgentSessionUsage(model_usage=[LLMModelUsage(
+        provider="Amazon", model="amazon.nova-2-5-sonic", input_tokens=869, input_audio_tokens=465,
+        input_text_tokens=404, output_tokens=307, output_audio_tokens=196, output_text_tokens=111)])
     session = FakeSession(
         chat("user", "", 0.0),  # the session's start
         heard("Hello, this is the Brief Voice AI model.", 7.29, "lk_greet"),
@@ -1136,20 +1174,25 @@ async def test_nova_sonic_usage_pieces_become_one_request_per_reply(http, monkey
         chat("user", "what are some things you can help me with", 32.34),
         heard("I can answer questions and give brief replies.", 32.44, "lk_reply_2"),
         chat("user", "can you tell me one interesting fact about space", 47.37),
-        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"))
+        llm=Realtime("amazon.nova-2-5-sonic", "Amazon"), usage=usage)
     session._recorded_events = [
         rt_event("7316680d", at, ttft=ttft, duration=0.0, given=it + ia, produced=ot + oa, audio_in=ia, audio_out=oa)
         for at, it, ia, ot, oa, ttft in NOVA_PIECES]
     diagnostics = (await ended_body(http, session))["diagnostics"]
 
-    # 869 tokens in and 307 out, the session's; the call ended before the fourth reply was heard
-    assert diagnostics["llm_requests"] == [
-        {"start_ms": 5820, "outcome": "spoken", "input_tokens": 541, "cached_input_tokens": 0, "output_tokens": 73},
-        {"start_ms": 21632, "outcome": "spoken", "input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 91},
-        {"start_ms": 32384, "outcome": "spoken", "input_tokens": 84, "cached_input_tokens": 0, "output_tokens": 92},
-        {"start_ms": 47496, "outcome": "not_spoken", "input_tokens": 124, "cached_input_tokens": 0,
-         "output_tokens": 51},
-    ]
+    assert "llm_requests" not in diagnostics
+    assert diagnostics["usage"] == {
+        "llm_input_tokens": 869, "llm_cached_input_tokens": 0, "llm_output_tokens": 307,
+        "llm_input_audio_tokens": 465, "llm_input_text_tokens": 404, "llm_output_audio_tokens": 196,
+        "llm_output_text_tokens": 111}
+
+
+async def test_a_text_llms_usage_has_no_speech_split(http):
+    usage = AgentSessionUsage(model_usage=[LLMModelUsage(
+        provider="openai", model="gpt-4.1-mini", input_tokens=500, input_text_tokens=500, output_tokens=50)])
+    diagnostics = (await ended_body(http, FakeSession(usage=usage)))["diagnostics"]
+
+    assert diagnostics["usage"] == {"llm_input_tokens": 500, "llm_cached_input_tokens": 0, "llm_output_tokens": 50}
 
 
 async def test_xais_session_close_record_is_no_request(http):
@@ -1193,6 +1236,15 @@ async def test_pipeline_failures_are_sent_as_errors(http):
         {"step": "tts", "side": "agent", "start_ms": 5000, "message": "cartesia.TTS: voice not found",
          "recovered": False},
     ]
+
+
+async def test_no_failure_is_sent_as_an_empty_error_list_but_only_from_an_event_record(http):
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))
+    session._recorded_events = []  # LiveKit records every session event: none was a failure
+    assert (await ended_body(http, session))["diagnostics"]["errors"] == []
+
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))  # an SDK without an event record
+    assert "errors" not in ((await ended_body(http, session)).get("diagnostics") or {})  # can't say there were none
 
 
 async def test_a_retried_failure_recovered_when_its_step_worked_again_before_failing_for_good(http):
@@ -1474,6 +1526,48 @@ async def test_ended_at_is_when_the_session_closed_not_the_later_shutdown(http):
 
     [ended] = http.posts("call.ended")
     assert ended.body["ended_at"] == test_data._iso(hung_up)
+
+
+async def closed_body(http, session, closed_at):
+    """One test call whose session closed at closed_at; its call.ended body."""
+    ctx = ctx_with_test_id()
+    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    await recognised(ctx)
+    session.emit("close", CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED, created_at=closed_at))
+    await ctx.shutdown()
+    return http.posts("call.ended")[-1].body
+
+
+def last_caller_line(states, stopped_at, closed_at):
+    """A call whose last caller line ("No.", from 10 s) LiveKit stopped at stopped_at, with these caller states."""
+    session = FakeSession(
+        heard("Anything else I can help with?", 1.0),
+        chat("user", "No.", 10.0, metrics={"started_speaking_at": T0 + 10.0, "stopped_speaking_at": T0 + stopped_at}))
+    session._recorded_events = states
+    return session, T0 + closed_at
+
+
+async def test_a_caller_line_cut_by_the_hang_up_ends_where_the_caller_stopped(http):
+    # LiveKit ends a line the call cut off at the close: on staging a "No." ran 11.5 s for 0.7 s of speech
+    session, closed = last_caller_line([caller("speaking", 10.0), caller("listening", 10.7)], 21.5, 21.6)
+    line = (await closed_body(http, session, closed))["transcript"][1]
+
+    assert line["end_ms"] - line["start_ms"] == 700
+
+
+async def test_a_caller_still_talking_at_the_close_gets_no_end(http):
+    session, closed = last_caller_line([caller("speaking", 10.0)], 21.5, 21.6)
+    line = (await closed_body(http, session, closed))["transcript"][1]
+
+    assert "start_ms" in line and "end_ms" not in line
+
+
+async def test_a_last_caller_line_that_really_ran_to_the_close_keeps_its_end(http):
+    # "No." then the caller hung up: the voice detector's stop is within 2 s of LiveKit's end, which stands
+    session, closed = last_caller_line([caller("speaking", 10.0), caller("listening", 11.0)], 10.6, 11.5)
+    line = (await closed_body(http, session, closed))["transcript"][1]
+
+    assert line["end_ms"] - line["start_ms"] == 600
 
 
 async def test_ended_at_is_never_before_the_start(http):
