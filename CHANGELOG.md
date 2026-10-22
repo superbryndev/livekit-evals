@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `usage` splits a realtime model's tokens into speech and text (`llm_input_audio_tokens`, `llm_input_text_tokens`, `llm_output_audio_tokens`, `llm_output_text_tokens`), which providers price apart. Sent only when the model reports speech tokens.
+- `configuration.turn_detection.preemptive_generation`: whether LiveKit drafts a reply before the caller's turn is confirmed and drops it if they go on (on by default since 1.8, up to 3 drafts per turn). Those dropped drafts are most of a cascaded agent's early starts, so SuperBryn can name the right cause instead of the end-of-turn wait.
 
 ### Changed
 - Nova Sonic sends no `llm_requests`. Its usage pieces share one request ID for the whole session and are stamped as each reply's audio arrives (within about 40 ms of the reply starting to play on staging calls), so neither a request's start nor what became of it can be told; 0.3.1's one-request-per-reply rebuild mislabelled spoken replies. Its tokens still count in `usage`. GPT Live, which also keeps one ID for the session, already sent none.

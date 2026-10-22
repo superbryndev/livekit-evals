@@ -684,6 +684,7 @@ async def test_configuration_from_turn_handling(http):
             "turn_detection": NamedDetector(),
             "endpointing": {"mode": "fixed", "min_delay": 0.3, "max_delay": 2.5, "alpha": 0.9},
             "interruption": {"enabled": True, "min_duration": 0.5, "min_words": 0, "mode": "adaptive"},
+            "preemptive_generation": {"enabled": False, "preemptive_tts": False, "max_retries": 3},
         }),
     )
     diagnostics = (await ended_body(http, session))["diagnostics"]
@@ -693,7 +694,8 @@ async def test_configuration_from_turn_handling(http):
         "stt": {"provider": "deepgram", "model": "nova-3"},
         "llm": {"provider": "openai", "model": "gpt-4.1"},
         "tts": {"provider": "cartesia", "model": "sonic-2", "voice": "voice-id"},
-        "turn_detection": {"type": "turn-detector-v1-mini", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500},
+        "turn_detection": {"type": "turn-detector-v1-mini", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500,
+                           "preemptive_generation": False},
         "interruptions": {"enabled": True, "min_duration_ms": 500, "min_words": 0},
     }
 
@@ -712,7 +714,7 @@ async def test_configuration_from_older_options_and_usage(http):
         llm=SimpleNamespace(provider="unknown", model="unknown"),  # a custom LLM that names neither
         tts=SimpleNamespace(provider="elevenlabs", model="", voice_id="voice-1"),
         options=SimpleNamespace(min_endpointing_delay=0.4, max_endpointing_delay=5.0, allow_interruptions=False,
-                                min_interruption_duration=0.7, min_interruption_words=2),
+                                min_interruption_duration=0.7, min_interruption_words=2, preemptive_generation=True),
         usage=AgentSessionUsage(model_usage=[
             LLMModelUsage(provider="", model=""),
             LLMModelUsage(provider="openai", model="gpt-4.1-mini"),
@@ -724,7 +726,7 @@ async def test_configuration_from_older_options_and_usage(http):
     assert configuration == {
         "llm": {"provider": "openai", "model": "gpt-4.1-mini"},
         "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5", "voice": "voice-1"},
-        "turn_detection": {"min_end_of_turn_ms": 400, "max_end_of_turn_ms": 5000},
+        "turn_detection": {"min_end_of_turn_ms": 400, "max_end_of_turn_ms": 5000, "preemptive_generation": True},
         "interruptions": {"enabled": False, "min_duration_ms": 700, "min_words": 2},
     }
 
@@ -779,12 +781,13 @@ async def test_live_turn_detection_is_what_livekit_resolved():  # real AgentSess
     stt = SimpleNamespace(capabilities=SimpleNamespace(streaming=True, aligned_transcript=False))
     session = AgentSession(stt=stt, vad=None,
                            turn_handling={"turn_detection": "stt", "endpointing": {"min_delay": 0.4}})
+    # LiveKit drafts replies early unless told not to
     assert test_data._live_turn_detection(AgentActivity(Agent(instructions="x"), session)) == {
-        "type": "stt", "min_end_of_turn_ms": 400, "max_end_of_turn_ms": 3000}
-    agent = Agent(instructions="x", turn_handling={"turn_detection": "manual",
+        "type": "stt", "min_end_of_turn_ms": 400, "max_end_of_turn_ms": 3000, "preemptive_generation": True}
+    agent = Agent(instructions="x", turn_handling={"turn_detection": "manual", "preemptive_generation": {"enabled": False},
                                                    "endpointing": {"min_delay": 1.2, "max_delay": 4.0}})
     assert test_data._live_turn_detection(AgentActivity(agent, session)) == {
-        "type": "manual", "min_end_of_turn_ms": 1200, "max_end_of_turn_ms": 4000}
+        "type": "manual", "min_end_of_turn_ms": 1200, "max_end_of_turn_ms": 4000, "preemptive_generation": False}
 
     assert test_data._live_turn_detection(None) is None
     assert test_data._live_turn_detection(SimpleNamespace(_turn_detection="vad")) is None  # another SDK shape
@@ -796,6 +799,8 @@ async def test_live_turn_detection_before_1_8():  # an AgentActivity without _rt
     assert test_data._live_turn_detection(older) == {"min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
     older._turn_detection = "vad"
     assert test_data._live_turn_detection(older) == {"type": "vad", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
+    older._session = SimpleNamespace(options=SimpleNamespace(preemptive_generation=False))  # a bool on the session
+    assert test_data._live_turn_detection(older)["preemptive_generation"] is False
     older.llm = Realtime()  # server-side turn detection takes the turns
     assert test_data._live_turn_detection(older) == {"type": "realtime_llm"}
 

@@ -740,11 +740,21 @@ def _turn_detection(options: Any) -> dict[str, Any]:
     if isinstance(handling, dict):
         detector, endpointing = handling.get("turn_detection"), handling.get("endpointing") or {}
         min_s, max_s = endpointing.get("min_delay"), endpointing.get("max_delay")
+        preemptive = handling.get("preemptive_generation")
     else:
         detector = None
         min_s, max_s = _attr(options, "min_endpointing_delay"), _attr(options, "max_endpointing_delay")
+        preemptive = _attr(options, "preemptive_generation")
     return _compact({"type": _detector_name(detector), "min_end_of_turn_ms": _millis(min_s),
-                     "max_end_of_turn_ms": _millis(max_s)})
+                     "max_end_of_turn_ms": _millis(max_s), "preemptive_generation": _preemptive(preemptive)})
+
+
+def _preemptive(value: Any) -> Optional[bool]:
+    """Whether LiveKit drafts a reply before the caller's turn is confirmed (and drops it if they go on): a bool before
+    1.8, then turn_handling's options, whose "enabled" says it."""
+    if isinstance(value, dict):
+        value = value.get("enabled")
+    return value if isinstance(value, bool) else None
 
 
 def _live_turn_detection(activity: Any) -> Optional[dict[str, Any]]:
@@ -758,9 +768,13 @@ def _live_turn_detection(activity: Any) -> Optional[dict[str, Any]]:
         realtime = isinstance(model, llm.RealtimeModel) and _attr(_attr(model, "capabilities"), "turn_detection") is True
     if realtime:  # the realtime model decides when the caller finished: no endpointing delays apply
         return {"type": "realtime_llm"}
+    # the agent's preemptive setting over the session's from 1.8; before, only the session's options carry it
+    preemptive = _attr(activity, "preemptive_generation_opts") or _attr(_attr(_attr(activity, "_session"), "options"),
+                                                                        "preemptive_generation")
     return _compact({"type": _detector_name(_attr(activity, "_turn_detection")),
                      "min_end_of_turn_ms": _millis(_attr(activity, "min_endpointing_delay")),
-                     "max_end_of_turn_ms": _millis(_attr(activity, "max_endpointing_delay"))})
+                     "max_end_of_turn_ms": _millis(_attr(activity, "max_endpointing_delay")),
+                     "preemptive_generation": _preemptive(preemptive)})
 
 
 def _detector_name(detector: Any) -> Optional[str]:
