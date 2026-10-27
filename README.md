@@ -240,7 +240,8 @@ feature-detected; nothing breaks).
 |---------|---------------|
 | `call.turn_detection` | Per-turn end-of-utterance delay, transcription delay, end-of-turn model inference stats |
 | `call.latency` (new keys) | `eou_ms`, `transcription_ms`, `e2e_ms` (EOU + LLM TTFT + TTS TTFB — true perceived latency) |
-| `call.speech_stats` | User/agent talk seconds, turn counts, talk ratio, silence, longest gap, response delays |
+| `call.speech_stats` | User/agent talk seconds, turn counts, talk ratio, silence, longest gap, response delays; realtime models also `speech_created_count` and `cancelled_responses` |
+| `call.transcript.turns[]` (realtime models) | Agent turns carry `provider_request_id`, and `turn_latency.llm_ms` is that reply's own time to first token (0 when not measured) |
 | `call.interruptions` | Interrupted agent turns, false interruptions, detected interruptions + backchannels (SDK ≥1.6) |
 | `call.network` | Connection quality timeline, reconnects, disconnect reasons, WebRTC stats polled every 10s (jitter, RTT, packet loss %, concealed samples, NACKs, bytes) |
 | `call.errors` | Typed provider failures (`stt_error`/`llm_error`/`tts_error`), message, `recoverable`, model, provider |

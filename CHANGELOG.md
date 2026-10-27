@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-10-27
+
+Realtime (speech-to-speech) models only. Cascaded (STT, LLM, TTS) agents send exactly what they did before: no new fields and the same values.
+
+### Added
+- Each agent turn carries `provider_request_id`, the provider's ID for that reply from LiveKit's message metrics. It links the turn to its response and to the provider's own trace.
+- `speech_stats.speech_created_count` (replies LiveKit started, greeting included) and `speech_stats.cancelled_responses` (responses the model reported as cancelled).
+
+### Fixed
+- A reply's `turn_latency.llm_ms` is that reply's own time to first token, found by its provider request ID, instead of the average of every reply so far. On a recorded GPT Realtime 2.1 call the third reply went out as 1434 ms but took 986 ms. It is 0 (not measured) when the response is unknown, reports no time (Gemini 3.1 Flash Live, Phonic), or shares its ID with other responses (Nova Sonic, GPT Live).
+
 ## [0.3.2] - 2026-10-21
 
 ### Added

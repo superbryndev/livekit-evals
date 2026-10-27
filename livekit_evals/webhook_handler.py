@@ -50,6 +50,7 @@ except ImportError:  # older livekit-rtc may not export these
 from .config import API_BASE_URL, CREDENTIALS_CONFIG, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
 from .prompt_sync import prompt_ref, push_prompt
 from .recording_manager import RecordingManager
+from .test_data import _pipeline
 
 logger = logging.getLogger("webhook_handler")
 
@@ -218,6 +219,15 @@ def _extract_project_id_from_url(livekit_url: str) -> Optional[str]:
     return None
 
 
+def _provider_request_id(item: Any) -> Optional[str]:
+    """The first provider request ID in a message's metrics (LiveKit 1.8+), or None."""
+    item_metrics = getattr(item, "metrics", None)
+    request_ids = item_metrics.get("provider_request_ids") if isinstance(item_metrics, dict) else None
+    if isinstance(request_ids, (list, tuple)) and request_ids and isinstance(request_ids[0], str):
+        return request_ids[0]
+    return None
+
+
 class WebhookHandler:
     """
     Handles webhook payload construction and delivery for LiveKit agent sessions.
@@ -367,6 +377,14 @@ class WebhookHandler:
 
         # Speech events tracking
         self.speech_events: list[dict[str, Any]] = []
+
+        # Realtime (speech-to-speech) sessions only; a cascaded session never sets or reads these.
+        # Each realtime response by request ID, its own ttft, IDs two responses share, and cancelled IDs.
+        self._realtime = False
+        self._realtime_responses: dict[str, Any] = {}
+        self._realtime_ttft_ms: dict[str, float] = {}
+        self._shared_request_ids: set[str] = set()
+        self._cancelled_request_ids: set[str] = set()
 
         # Defensive base-component metrics subscriptions.
         # Custom user wrappers (e.g. ``SanitizedTTS``, ``VolumeTTS``,
@@ -906,6 +924,7 @@ class WebhookHandler:
         
         # Extract model/provider info from session configuration
         self._extract_session_config(session)
+        self._realtime = _pipeline(session) == "realtime"
         
         # Listen to conversation items for transcript
         session.on("conversation_item_added")(self._on_conversation_item_added)
@@ -1022,6 +1041,12 @@ class WebhookHandler:
                 # Calculate response delay for assistant turns
                 if speaker == "assistant" and self.last_user_turn_time_ms is not None:
                     turn["response_delay_ms"] = turn["start_time_ms"] - self.last_user_turn_time_ms
+                
+                # Realtime only: the provider's ID for this reply (links it to its metrics and provider trace)
+                if speaker == "assistant" and self._realtime:
+                    request_id = _provider_request_id(item)
+                    if request_id:
+                        turn["provider_request_id"] = request_id
                 
                 # Update last user turn time
                 if speaker == "user":
@@ -1561,6 +1586,8 @@ class WebhookHandler:
     def _on_metrics_collected(self, event: MetricsCollectedEvent) -> None:
         """Handle metrics collected event."""
         metrics_obj = event.metrics
+        if isinstance(metrics_obj, RealtimeModelMetrics):
+            self._note_realtime_response(metrics_obj)
 
         # Dedup metrics that may be observed both via ``session`` (wrapper-
         # forwarded) and via our defensive base-component subscription.  Only
@@ -1650,6 +1677,36 @@ class WebhookHandler:
             # VAD/EOU/EOT/interruption metrics — matched by their `type`
             # discriminator so this works on SDKs where the classes don't exist
             self._collect_extended_metrics(metrics_obj)
+
+    def _note_realtime_response(self, metrics_obj: Any) -> None:
+        """Keep a realtime response's own ttft by request ID. Runs before dedup: the same object delivered twice
+        is one response, while a second object on the same ID (Nova Sonic, GPT Live) makes that ID shared."""
+        try:
+            self._realtime = True
+            request_id = getattr(metrics_obj, "request_id", None)
+            if not request_id or request_id == "session_close":  # the empty opening record; xAI's close
+                return
+            first = self._realtime_responses.setdefault(request_id, metrics_obj)
+            if first is not metrics_obj:
+                self._shared_request_ids.add(request_id)
+            if getattr(metrics_obj, "cancelled", False):
+                self._cancelled_request_ids.add(request_id)
+            ttft = getattr(metrics_obj, "ttft", None)
+            if first is metrics_obj and isinstance(ttft, (int, float)) and ttft > 0:  # -1 / 0: not measured
+                self._realtime_ttft_ms[request_id] = ttft * 1000
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to note realtime response: %s", e)
+
+    def _set_realtime_turn_latencies(self, turns: list[dict[str, Any]]) -> None:
+        """A realtime reply's llm_ms is its own response's ttft, found by provider request ID, instead of the
+        running average; 0 (not measured) when the ID is missing, unknown or shared. tts_ms is left as it was."""
+        for turn in turns:
+            if turn.get("speaker") != "assistant":
+                continue
+            request_id = turn.get("provider_request_id")
+            llm_ms = 0 if request_id in self._shared_request_ids else self._realtime_ttft_ms.get(request_id, 0)
+            tts_ms = (turn.get("turn_latency") or {}).get("tts_ms", 0)
+            turn["turn_latency"] = {"llm_ms": llm_ms, "tts_ms": tts_ms, "total_ms": llm_ms + tts_ms}
 
     def _collect_extended_metrics(self, metrics_obj: Any) -> None:
         try:
@@ -1862,6 +1919,8 @@ class WebhookHandler:
         turns_with_text = [turn for turn in self.transcript_turns if turn.get("text") and turn["text"].strip()]
         logger.info("Filtered transcript: %d total turns, %d turns with text",
                    len(self.transcript_turns), len(turns_with_text))
+        if self._realtime:
+            self._set_realtime_turn_latencies(turns_with_text)
         
         # Ensure agent_id is set (required by webhook endpoint)
         if not self.agent_id:
@@ -2019,7 +2078,7 @@ class WebhookHandler:
             longest_gap_ms = max(longest_gap_ms, next_start - prev_end)
 
         total_talk = user_seconds + agent_seconds
-        return {
+        stats = {
             "user_talk_seconds": round(user_seconds, 2),
             "agent_talk_seconds": round(agent_seconds, 2),
             "user_turn_count": user_turns,
@@ -2033,6 +2092,11 @@ class WebhookHandler:
             "avg_response_delay_ms": round(self._calculate_average_latency(response_delays), 1),
             "max_response_delay_ms": round(max(response_delays), 1) if response_delays else 0.0,
         }
+        if self._realtime:
+            # Replies LiveKit started (greeting included) and responses the model reported as cancelled
+            stats["speech_created_count"] = len(self.speech_events)
+            stats["cancelled_responses"] = len(self._cancelled_request_ids)
+        return stats
 
     def _build_interruptions_section(self, turns: list[dict[str, Any]]) -> dict[str, Any]:
         section = {
