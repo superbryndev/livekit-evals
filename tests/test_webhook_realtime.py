@@ -10,6 +10,7 @@ import pytest
 from livekit.agents import llm
 from livekit.agents.llm import ChatMessage
 from livekit.agents.metrics import LLMMetrics, RealtimeModelMetrics, TTSMetrics
+from livekit.agents.metrics.base import Metadata
 
 from livekit_evals import webhook_handler as wh
 
@@ -83,10 +84,11 @@ async def attach(session, **options):
     return handler
 
 
-def realtime_response(request_id, ttft, cancelled=False):
+def realtime_response(request_id, ttft, cancelled=False, model=None):
     return RealtimeModelMetrics(label="openai.RealtimeModel", request_id=request_id, timestamp=T0, ttft=ttft,
                                 cancelled=cancelled, input_token_details=RealtimeModelMetrics.InputTokenDetails(),
-                                output_token_details=RealtimeModelMetrics.OutputTokenDetails())
+                                output_token_details=RealtimeModelMetrics.OutputTokenDetails(),
+                                metadata=Metadata(model_name=model) if model else None)
 
 
 def reply(session, at, text, request_ids, metrics=(), interrupted=False):
@@ -174,15 +176,15 @@ async def test_speech_stats_count_replies_started_and_responses_cancelled():
 async def test_realtime_found_from_its_metrics_when_attach_cannot_see_the_model():
     session = FakeSession()  # the model sits on an Agent that hasn't started yet
     handler = await attach(session)
-    reply(session, T0 + 1, "Hello!", ["resp_1"], [realtime_response("resp_1", 1.1)])
+    reply(session, T0 + 1, "Hello!", ["resp_1"], [realtime_response("resp_1", 1.1, model="gpt-realtime")])
 
     turn = agent_turns(handler)[0]
     assert turn["provider_request_id"] == "resp_1"
-    assert turn["turn_latency"]["llm_ms"] == pytest.approx(1100)
+    assert turn["turn_latency"]["llm_ms"] == pytest.approx(1100)  # the metrics name a model with real timings
 
 
 @pytest.mark.parametrize("extended", [True, False])
-async def test_cascaded_session_payload_is_unchanged(extended):
+async def test_cascaded_session_gets_no_realtime_fields(extended):
     session = FakeSession(llm=SimpleNamespace(model="gpt-4.1-mini"), stt=SimpleNamespace(model="nova-3"),
                           tts=SimpleNamespace(model="sonic-2"))
     handler = await attach(session, extended_capture=extended)
@@ -203,8 +205,8 @@ async def test_cascaded_session_payload_is_unchanged(extended):
     call = handler._build_webhook_payload()["call"]
     turns = [t for t in call["transcript"]["turns"] if t["speaker"] == "assistant"]
     assert not NEW_TURN_KEYS & {key for t in turns for key in t}
-    # unchanged: a cascaded turn's llm_ms is still the running average (400, then (400 + 600) / 2); without
-    # extended capture these session-level metrics aren't subscribed, so 0 as before
+    # replies without per-reply message metrics (older LiveKit) keep the running average (400, then (400 + 600) / 2);
+    # without extended capture these session-level metrics aren't subscribed, so 0
     expected = [pytest.approx(400), pytest.approx(500)] if extended else [0, 0]
     assert [t["turn_latency"]["llm_ms"] for t in turns] == expected
     if extended:
