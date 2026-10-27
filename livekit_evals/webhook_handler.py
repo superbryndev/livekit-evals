@@ -30,7 +30,7 @@ from livekit.agents import (
     metrics,
 )
 from livekit.agents.voice.events import AgentState, UserState
-from livekit.agents.llm import ChatMessage
+from livekit.agents.llm import ChatMessage, RealtimeModel
 from livekit.agents.metrics import (
     LLMMetrics,
     STTMetrics,
@@ -50,6 +50,7 @@ except ImportError:  # older livekit-rtc may not export these
 from .config import API_BASE_URL, CREDENTIALS_CONFIG, WEBHOOK_CONFIG, LIVEKIT_CONFIG, AGENT_CONFIG
 from .prompt_sync import prompt_ref, push_prompt
 from .recording_manager import RecordingManager
+from .test_data import _caller_times_real, _model_times_real, _pipeline, _running
 
 logger = logging.getLogger("webhook_handler")
 
@@ -63,6 +64,9 @@ _RTC_POLL_INTERVAL_S = 10.0
 _ERROR_MSG_MAX_LEN = 500
 
 _QUALITY_RANK = {"excellent": 0, "good": 1, "poor": 2, "lost": 3}
+_KNOWN_VENDORS = {"openai", "google", "xai", "anthropic", "deepgram", "cartesia", "elevenlabs", "assemblyai", "rime",
+                  "inworld", "mistral", "meta", "groq", "cerebras", "baseten", "sarvam", "speechmatics", "gladia",
+                  "aws", "azure", "phonic"}
 
 
 def _enum_name(enum_cls: Any, value: Any) -> str:
@@ -218,6 +222,28 @@ def _extract_project_id_from_url(livekit_url: str) -> Optional[str]:
     return None
 
 
+def _attr_safe(obj: Any, name: str) -> Any:
+    """getattr that also swallows errors raised by properties (session.current_agent before start)."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _item_metrics(item: Any) -> dict[str, Any]:
+    """A message's LiveKit metrics (started/stopped_speaking_at, llm_node_ttft, ...); {} on older SDKs."""
+    metrics = getattr(item, "metrics", None)
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def _provider_request_id(item: Any) -> Optional[str]:
+    """The first provider request ID in a message's metrics (LiveKit 1.8+), or None."""
+    request_ids = _item_metrics(item).get("provider_request_ids")
+    if isinstance(request_ids, (list, tuple)) and request_ids and isinstance(request_ids[0], str):
+        return request_ids[0]
+    return None
+
+
 class WebhookHandler:
     """
     Handles webhook payload construction and delivery for LiveKit agent sessions.
@@ -327,13 +353,16 @@ class WebhookHandler:
         # Transcript tracking
         self.transcript_turns: list[dict[str, Any]] = []
         self.call_start_time_ms: Optional[int] = None
-        self.last_user_turn_time_ms: Optional[int] = None
 
         # Tool call tracking
         self.tool_calls: list[dict[str, Any]] = []
 
         # Agent handoff tracking (non-message conversation items)
         self.agent_handoffs: list[dict[str, Any]] = []
+        # Every agent that ran (id + its prompt) and which one is speaking now; turns carry its id
+        self.agents: list[dict[str, Any]] = []
+        self._current_agent_id: Optional[str] = None
+        self._session: Any = None
 
         # Usage metrics tracking
         self.usage_metrics = {
@@ -368,6 +397,14 @@ class WebhookHandler:
         # Speech events tracking
         self.speech_events: list[dict[str, Any]] = []
 
+        # Realtime (speech-to-speech) sessions only; a cascaded session never sets or reads these.
+        # Each realtime response by request ID, its own ttft, IDs two responses share, and cancelled IDs.
+        self._realtime = False
+        self._realtime_responses: dict[str, Any] = {}
+        self._realtime_ttft_ms: dict[str, float] = {}
+        self._shared_request_ids: set[str] = set()
+        self._cancelled_request_ids: set[str] = set()
+
         # Defensive base-component metrics subscriptions.
         # Custom user wrappers (e.g. ``SanitizedTTS``, ``VolumeTTS``,
         # ``MixedAudioTTS``, ``NetworkGlitchTTS``) frequently forget to forward
@@ -377,7 +414,7 @@ class WebhookHandler:
         # the base TTS/STT/LLM components as a safety net, and these structures
         # let us dedup re-emitted events and unsubscribe on session close.
         self._base_metric_subscriptions: list[tuple[Any, Any]] = []
-        self._seen_metrics: set[tuple[Optional[str], Optional[str], Optional[str]]] = set()
+        self._seen_metrics: set[tuple[Any, ...]] = set()
 
         # Extended capture (additive payload sections; see _build_extended_sections)
         self.extended_capture = extended_capture
@@ -717,7 +754,14 @@ class WebhookHandler:
                 # This is common for providers like Sarvam where model name IS the voice.
                 if not self.usage_metrics["tts_voice_id"] and self.usage_metrics["tts_model"]:
                     self.usage_metrics["tts_voice_id"] = self.usage_metrics["tts_model"]
-            
+
+            # A realtime model speaks for itself: its voice is the call's voice
+            realtime_llm = _unwrap_to_base_component(_running(session, "llm"), _LLM_INNER_ATTRS)
+            if isinstance(realtime_llm, RealtimeModel) and not self.usage_metrics["tts_voice_id"]:
+                voice = getattr(getattr(realtime_llm, "_opts", None), "voice", None) or getattr(realtime_llm, "voice", None)
+                if isinstance(voice, str) and voice:
+                    self.usage_metrics["tts_voice_id"] = voice
+
             # Apply provider detection based on model names
             if self.usage_metrics["llm_model"]:
                 detected_provider = self._detect_provider_from_model_name(self.usage_metrics["llm_model"])
@@ -746,7 +790,15 @@ class WebhookHandler:
             return 'unknown'
         
         model_lower = model_name.lower()
-        
+
+        # LiveKit Inference names the vendor before the slash ("xai/grok-voice-3.0"); Bedrock models start
+        # "amazon." ("amazon.nova-2-5-sonic", which the "sonic"/"nova" checks below would call cartesia/deepgram)
+        vendor, slash, _ = model_lower.partition("/")
+        if slash and vendor in _KNOWN_VENDORS:
+            return vendor
+        if model_lower.startswith("amazon."):
+            return 'aws'
+
         # LLM Providers
         if any(x in model_lower for x in ['gpt', 'openai', 'whisper', 'tts-1', 'o1-', 'o3-']):
             return 'openai'
@@ -906,6 +958,9 @@ class WebhookHandler:
         
         # Extract model/provider info from session configuration
         self._extract_session_config(session)
+        self._realtime = _pipeline(session) == "realtime"
+        self._session = session
+        self._note_agent(_attr_safe(session, "current_agent"))
         
         # Listen to conversation items for transcript
         session.on("conversation_item_added")(self._on_conversation_item_added)
@@ -1006,31 +1061,38 @@ class WebhookHandler:
 
         # Determine speaker role
         speaker = "user" if item.role == "user" else "assistant"
-        
+
         # Get text content
         text = item.text_content or ""
-        
+
+        if speaker == "user":
+            # LiveKit's caller message is the whole turn: it settles the pieces STT finals left behind
+            self._settle_caller_turn(item, text)
+            return
+
         # Find the most recent turn for this speaker WITHOUT text and fill it in
         turn_found = False
         for turn in reversed(self.transcript_turns):
             if turn["speaker"] == speaker and not turn["text"]:
                 turn["text"] = text
                 turn["interrupted"] = item.interrupted if hasattr(item, "interrupted") else False
-                turn["turn_latency"] = self._get_turn_latency(speaker)
+                turn["turn_latency"] = self._reply_latency(item)
+                # playback's own stop: agent_state goes quiet ~0.2 s early on a cut-off reply
+                stopped = _item_metrics(item).get("stopped_speaking_at")
+                if isinstance(stopped, (int, float)) and stopped > 0 and self._rel_ms(stopped) is not None:
+                    turn["end_time_ms"] = self._rel_ms(stopped)
                 turn["confidence_score"] = self._get_confidence_score(item)
-                
-                # Calculate response delay for assistant turns
-                if speaker == "assistant" and self.last_user_turn_time_ms is not None:
-                    turn["response_delay_ms"] = turn["start_time_ms"] - self.last_user_turn_time_ms
-                
-                # Update last user turn time
-                if speaker == "user":
-                    self.last_user_turn_time_ms = turn["end_time_ms"] if turn["end_time_ms"] else turn["start_time_ms"]
-                
+
+                # Realtime only: the provider's ID for this reply (links it to its metrics and provider trace)
+                if self._realtime:
+                    request_id = _provider_request_id(item)
+                    if request_id:
+                        turn["provider_request_id"] = request_id
+
                 logger.debug("✓ Filled text for %s turn: %s...", speaker, text[:200])
                 turn_found = True
                 break
-        
+
         if not turn_found:
             # Usually benign: the STT path (user_input_transcribed) already filled
             # this turn before the message item arrived, so there's no empty turn
@@ -1047,6 +1109,16 @@ class WebhookHandler:
                 logger.debug("No open %s turn to attach text to: %s...", speaker, text[:200])
 
         logger.debug("Transcript turn text updated: %s - %s...", speaker, text[:500])
+
+    def _note_agent(self, agent: Any, agent_id: Optional[str] = None) -> None:
+        """Make this agent the one speaking now and list it (with its prompt) once."""
+        agent_id = agent_id or getattr(agent, "id", None)
+        if not agent_id:
+            return
+        self._current_agent_id = agent_id
+        if not any(a["agent_id"] == agent_id for a in self.agents):
+            instructions = getattr(agent, "instructions", None) if agent is not None else None
+            self.agents.append({"agent_id": agent_id, "instructions": str(instructions) if instructions else None})
 
     def _track_agent_handoff(self, item: Any) -> None:
         """Record an ``AgentHandoff`` conversation item for observability.
@@ -1070,6 +1142,10 @@ class WebhookHandler:
                 "timestamp_ms": timestamp_ms,
             }
             self.agent_handoffs.append(entry)
+            # the new agent is running by the time its handoff item lands
+            current = _attr_safe(self._session, "current_agent")
+            self._note_agent(current if getattr(current, "id", None) == entry["new_agent_id"] else None,
+                             entry["new_agent_id"])
             logger.info(
                 "Agent handoff captured: %s -> %s",
                 entry["old_agent_id"],
@@ -1095,54 +1171,130 @@ class WebhookHandler:
             transcript_text = getattr(event, "text", None)
         transcript_text = (transcript_text or "").strip()
 
-        # Find the most recent user turn without text and fill it in.
-        target_turn = None
-        for turn in reversed(self.transcript_turns):
-            if turn.get("speaker") == "user" and not (turn.get("text") or "").strip():
-                target_turn = turn
-                break
-
-        # Fallback: if we didn't observe a user_state_changed start turn (rare),
-        # append a minimal user turn so we don't lose the transcript entirely.
+        # The caller turn still open (no agent reply since it ended) takes this final; a later final of the same
+        # turn is appended, so one turn stays one turn. An empty final opens nothing (Nova's opening "").
+        target_turn = self._open_caller_turn()
         if target_turn is None:
-            current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            state_time_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else 0
-            timestamp = datetime.now(timezone.utc).isoformat()
-            target_turn = {
-                "speaker": "user",
-                "text": "",
-                "timestamp": timestamp,
-                "start_timestamp": timestamp,
-                "end_timestamp": timestamp,
-                "start_time_ms": state_time_ms,
-                "end_time_ms": state_time_ms,
-                "response_delay_ms": None,
-                "interrupted": False,
-                "turn_latency": None,
-                "confidence_score": None,
-                "language": None,
-                "speaker_id": None,
-            }
+            if not transcript_text:
+                return
+            target_turn = self._new_caller_turn()
             self.transcript_turns.append(target_turn)
 
-        # Fill in text from STT if we have it and the turn is empty.
-        if transcript_text and not (target_turn.get("text") or "").strip():
-            target_turn["text"] = transcript_text
-            target_turn["turn_latency"] = self._get_turn_latency("user")
-
-            # Keep response_delay computation consistent with conversation_item_added path
-            self.last_user_turn_time_ms = (
-                target_turn.get("end_time_ms") if target_turn.get("end_time_ms") is not None else target_turn.get("start_time_ms")
-            )
-
+        if transcript_text:
+            current = (target_turn.get("text") or "").strip()
+            target_turn["text"] = f"{current} {transcript_text}" if current else transcript_text
+            if target_turn.get("turn_latency") is None:
+                target_turn["turn_latency"] = self._get_turn_latency("user")
             logger.debug("✓ Filled text for user turn from STT: %s...", transcript_text[:200])
 
         # Always store metadata if available
-        target_turn["language"] = getattr(event, "language", None)
+        language = getattr(event, "language", None)
+        if language:
+            target_turn["language"] = language
         speaker_id = getattr(event, "speaker_id", None)
         if speaker_id:
             target_turn["speaker_id"] = speaker_id
-    
+
+    def _new_caller_turn(self, start_ms: Optional[int] = None) -> dict[str, Any]:
+        """A caller turn no user_state_changed opened (rare): timed now unless a start is given."""
+        current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        state_time_ms = current_time_ms - self.call_start_time_ms if self.call_start_time_ms else 0
+        timestamp = datetime.now(timezone.utc).isoformat()
+        start = start_ms if start_ms is not None else state_time_ms
+        return {
+            "speaker": "user",
+            "text": "",
+            "timestamp": timestamp,
+            "start_timestamp": timestamp,
+            "end_timestamp": timestamp,
+            "start_time_ms": start,
+            "end_time_ms": state_time_ms,
+            "response_delay_ms": None,
+            "interrupted": False,
+            "turn_latency": None,
+            "confidence_score": None,
+            "language": None,
+            "speaker_id": None,
+            "agent_id": self._current_agent_id,
+        }
+
+    def _open_caller_turn(self) -> Optional[dict[str, Any]]:
+        """The newest caller turn, unless an agent reply started after it ended: a late final (or LiveKit's message for
+        it) still belongs to it."""
+        caller = next((t for t in reversed(self.transcript_turns) if t["speaker"] == "user"), None)
+        if caller is None:
+            return None
+        if not (caller.get("text") or "").strip():
+            return caller  # its transcript hasn't come yet: it's this one, however late (realtime models)
+        since =caller.get("end_time_ms") if caller.get("end_time_ms") is not None else caller.get("start_time_ms")
+        replied = any(t["speaker"] == "assistant" and (t.get("start_time_ms") or 0) >= (since or 0)
+                      for t in self.transcript_turns)
+        return None if replied else caller
+
+    def _settle_caller_turn(self, item: Any, text: str) -> None:
+        """Make the caller's message one turn: merge the pieces it covers, take its own text, times and confidence.
+        Pieces are the unsettled caller turns within its speech window (or, without times, since the last reply)."""
+        metrics = _item_metrics(item)
+        started = self._rel_ms(metrics["started_speaking_at"]) if metrics.get("started_speaking_at") else None
+        stopped = self._rel_ms(metrics["stopped_speaking_at"]) if metrics.get("stopped_speaking_at") else None
+        pieces = [t for t in self._unsettled_caller_run() if self._covers(t, started, stopped)]
+        if not pieces:
+            open_turn = self._open_caller_turn()
+            if open_turn is not None and started is None:
+                # LiveKit split a late transcript of the same caller turn into its own message, with no times
+                current = (open_turn.get("text") or "").strip()
+                if text.strip() and text.strip() not in current:
+                    open_turn["text"] = f"{current} {text.strip()}".strip()
+                return
+            if not text.strip():
+                return
+            turn = self._new_caller_turn(started)
+            self.transcript_turns.append(turn)
+            pieces = [turn]
+        turn = pieces[0]
+        for extra in pieces[1:]:
+            self.transcript_turns.remove(extra)
+            turn["language"] = turn.get("language") or extra.get("language")
+            if extra.get("end_time_ms") is not None:
+                turn["end_time_ms"] = max(turn.get("end_time_ms") or 0, extra["end_time_ms"])
+                turn["end_timestamp"] = extra.get("end_timestamp")
+        if text.strip():
+            turn["text"] = text
+        if started is not None:
+            turn["start_time_ms"] = min(turn["start_time_ms"], started) if turn.get("start_time_ms") is not None else started
+        if stopped is not None:
+            # the voice detector's stop, not user_state's (which waits out the silence window first)
+            turn["end_time_ms"] = stopped
+        confidence = self._get_confidence_score(item)
+        if confidence is not None and not (self._realtime and confidence == 1.0):  # realtime 1.0 is a stand-in
+            turn["confidence_score"] = confidence
+        delay = metrics.get("transcription_delay")
+        if isinstance(delay, (int, float)):
+            turn["turn_latency"] = {"stt_ms": delay * 1000, "total_ms": delay * 1000}
+        turn["_settled"] = True
+
+    def _unsettled_caller_run(self) -> list[dict[str, Any]]:
+        """The unsettled caller turns since the last agent reply that started before them (oldest first)."""
+        run: list[dict[str, Any]] = []
+        for turn in reversed(self.transcript_turns):
+            if turn["speaker"] == "user":
+                if turn.get("_settled"):
+                    break
+                run.append(turn)
+            elif run:
+                break
+        return list(reversed(run))
+
+    @staticmethod
+    def _covers(turn: dict[str, Any], started: Optional[int], stopped: Optional[int]) -> bool:
+        """Whether a caller piece falls in the message's speech window (always, without times)."""
+        start, end = turn.get("start_time_ms"), turn.get("end_time_ms")
+        if stopped is not None and start is not None and start > stopped + 1500:
+            return False
+        if started is not None and end is not None and end < started - 1500:
+            return False
+        return True
+
     def _on_agent_state_changed(self, event: AgentStateChangedEvent) -> None:
         """Handle agent state changes for precise timing."""
         try:
@@ -1172,6 +1324,7 @@ class WebhookHandler:
                     "confidence_score": None,
                     "language": None,
                     "speaker_id": None,
+                    "agent_id": self._current_agent_id,
                 }
                 self.transcript_turns.append(turn)
                 logger.debug("✓ Created assistant turn at start")
@@ -1220,6 +1373,7 @@ class WebhookHandler:
                     "confidence_score": None,
                     "language": None,
                     "speaker_id": None,
+                    "agent_id": self._current_agent_id,
                 }
                 self.transcript_turns.append(turn)
                 # logger.info("✓ Created user turn at start")
@@ -1374,14 +1528,17 @@ class WebhookHandler:
             err = getattr(event, "error", None)
             source = getattr(event, "source", None)
             inner = getattr(err, "error", None) if err is not None else None
+            source_model = getattr(source, "model", None)
+            # the model names the vendor ("openai/gpt-4.1-mini"); the module only says "llm" for LiveKit Inference
+            by_model = self._detect_provider_from_model_name(source_model) if isinstance(source_model, str) else "unknown"
             entry = {
                 "timestamp_ms": self._rel_ms(getattr(event, "created_at", None)),
                 "error_type": getattr(err, "type", None) or type(err).__name__,
                 "message": str(inner if inner is not None else err)[:_ERROR_MSG_MAX_LEN],
                 "recoverable": getattr(err, "recoverable", None),
                 "label": getattr(err, "label", None),
-                "source_model": getattr(source, "model", None),
-                "source_provider": _extract_provider_from_module(source),
+                "source_model": source_model,
+                "source_provider": by_model if by_model != "unknown" else _extract_provider_from_module(source),
             }
             if len(self.error_events) < _MAX_ERROR_EVENTS:
                 self.error_events.append(entry)
@@ -1561,6 +1718,8 @@ class WebhookHandler:
     def _on_metrics_collected(self, event: MetricsCollectedEvent) -> None:
         """Handle metrics collected event."""
         metrics_obj = event.metrics
+        if isinstance(metrics_obj, RealtimeModelMetrics):
+            self._note_realtime_response(metrics_obj)
 
         # Dedup metrics that may be observed both via ``session`` (wrapper-
         # forwarded) and via our defensive base-component subscription.  Only
@@ -1568,10 +1727,13 @@ class WebhookHandler:
         # never flow through the base subscription and don't have a stable
         # request_id, so we skip dedup for them.
         if isinstance(metrics_obj, (LLMMetrics, STTMetrics, TTSMetrics, RealtimeModelMetrics)):
+            # timestamp too: a streamed STT session reports every chunk under one request_id, and Nova Sonic's
+            # usage pieces share one, so without it every report after the first was dropped
             key = (
                 getattr(metrics_obj, "type", None),
                 getattr(metrics_obj, "request_id", None),
                 getattr(metrics_obj, "segment_id", None),
+                getattr(metrics_obj, "timestamp", None),
             )
             if key in self._seen_metrics:
                 return
@@ -1651,6 +1813,40 @@ class WebhookHandler:
             # discriminator so this works on SDKs where the classes don't exist
             self._collect_extended_metrics(metrics_obj)
 
+    def _note_realtime_response(self, metrics_obj: Any) -> None:
+        """Keep a realtime response's own ttft by request ID. Runs before dedup: the same object delivered twice
+        is one response, while a second object on the same ID (Nova Sonic, GPT Live) makes that ID shared."""
+        try:
+            self._realtime = True
+            request_id = getattr(metrics_obj, "request_id", None)
+            if not request_id or request_id == "session_close":  # the empty opening record; xAI's close
+                return
+            first = self._realtime_responses.setdefault(request_id, metrics_obj)
+            if first is not metrics_obj:
+                self._shared_request_ids.add(request_id)
+            if getattr(metrics_obj, "cancelled", False):
+                self._cancelled_request_ids.add(request_id)
+            ttft = getattr(metrics_obj, "ttft", None)
+            if first is metrics_obj and isinstance(ttft, (int, float)) and ttft > 0:  # -1 / 0: not measured
+                self._realtime_ttft_ms[request_id] = ttft * 1000
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to note realtime response: %s", e)
+
+    def _set_realtime_turn_latencies(self, turns: list[dict[str, Any]], timed: bool = True) -> None:
+        """A realtime reply's llm_ms is its own response's ttft, found by provider request ID, instead of the
+        running average; 0 (not measured) when the ID is missing, unknown or shared. tts_ms is left as it was.
+        None for a model whose ttft isn't a reply time (timed False)."""
+        for turn in turns:
+            if turn.get("speaker") != "assistant":
+                continue
+            if not timed:
+                turn["turn_latency"] = None
+                continue
+            request_id = turn.get("provider_request_id")
+            llm_ms = 0 if request_id in self._shared_request_ids else self._realtime_ttft_ms.get(request_id, 0)
+            tts_ms = (turn.get("turn_latency") or {}).get("tts_ms", 0)
+            turn["turn_latency"] = {"llm_ms": llm_ms, "tts_ms": tts_ms, "total_ms": llm_ms + tts_ms}
+
     def _collect_extended_metrics(self, metrics_obj: Any) -> None:
         try:
             mtype = getattr(metrics_obj, "type", None)
@@ -1708,7 +1904,7 @@ class WebhookHandler:
             ``NetworkGlitchTTS``, ...) doesn't forward the event.
 
         Both may deliver the same event; ``_on_metrics_collected`` de-duplicates
-        via ``self._seen_metrics`` on ``(type, request_id, segment_id)``.
+        via ``self._seen_metrics`` on ``(type, request_id, segment_id, timestamp)``.
         """
         seen_targets: set[int] = set()
         for outer, inner_attrs, label in (
@@ -1850,6 +2046,9 @@ class WebhookHandler:
             avg_latency["transcription_ms"] = self._calculate_average_latency(self.transcription_delays_ms)
             # Perceived response latency: turn-end detection + LLM TTFT + TTS TTFB
             avg_latency["e2e_ms"] = avg_latency["eou_ms"] + avg_latency["llm_ms"] + avg_latency["tts_ms"]
+        if not self._realtime_timed():
+            # Gemini Live, Nova Sonic, GPT Live: LiveKit's ttft is -1, 0 or a few ms, not a reply time
+            avg_latency.update({k: None for k in ("llm_ms", "total_ms", "e2e_ms") if k in avg_latency})
 
         # Backfill usage from session_usage_updated when the per-plugin path saw
         # nothing (e.g. realtime models emit metrics on an internal session).
@@ -1862,6 +2061,9 @@ class WebhookHandler:
         turns_with_text = [turn for turn in self.transcript_turns if turn.get("text") and turn["text"].strip()]
         logger.info("Filtered transcript: %d total turns, %d turns with text",
                    len(self.transcript_turns), len(turns_with_text))
+        if self._realtime:
+            self._set_realtime_turn_latencies(turns_with_text, self._realtime_timed())
+        turns_with_text = self._finish_transcript(turns_with_text)
         
         # Ensure agent_id is set (required by webhook endpoint)
         if not self.agent_id:
@@ -1915,6 +2117,8 @@ class WebhookHandler:
                     "tts_provider": self.usage_metrics["tts_provider"],
                     "tts_voice_id": self.usage_metrics["tts_voice_id"],
                     "system_prompt": self.system_prompt,
+                    # After a handoff: every agent that ran, with its own prompt (turns carry agent_id)
+                    **({"agents": self.agents} if len(self.agents) > 1 else {}),
                     # Names the pushed prompt this call ran on (prompt sync).
                     **({"prompt_ref": prompt_ref(self.prompt, self.prompt_version)} if self.prompt and self.sync_prompt else {}),
                     # LiveKit feature flags for cost calculation
@@ -2019,7 +2223,7 @@ class WebhookHandler:
             longest_gap_ms = max(longest_gap_ms, next_start - prev_end)
 
         total_talk = user_seconds + agent_seconds
-        return {
+        stats = {
             "user_talk_seconds": round(user_seconds, 2),
             "agent_talk_seconds": round(agent_seconds, 2),
             "user_turn_count": user_turns,
@@ -2030,9 +2234,18 @@ class WebhookHandler:
             # Approximate: overlapping speech is not subtracted
             "silence_seconds": round(max(0.0, duration_seconds - total_talk), 2),
             "longest_silence_ms": longest_gap_ms,
-            "avg_response_delay_ms": round(self._calculate_average_latency(response_delays), 1),
-            "max_response_delay_ms": round(max(response_delays), 1) if response_delays else 0.0,
+            "avg_response_delay_ms": round(self._calculate_average_latency(response_delays), 1) if response_delays else None,
+            "max_response_delay_ms": round(max(response_delays), 1) if response_delays else None,
         }
+        if not self._caller_real():
+            # caller times are a stand-in: anything built from them would count the caller's speech as silence
+            stats.update(user_talk_seconds=None, avg_user_turn_seconds=None, agent_talk_ratio=None,
+                         silence_seconds=None, longest_silence_ms=None)
+        if self._realtime:
+            # Replies LiveKit started (greeting included) and responses the model reported as cancelled
+            stats["speech_created_count"] = len(self.speech_events)
+            stats["cancelled_responses"] = len(self._cancelled_request_ids)
+        return stats
 
     def _build_interruptions_section(self, turns: list[dict[str, Any]]) -> dict[str, Any]:
         section = {
@@ -2191,6 +2404,54 @@ class WebhookHandler:
         # For now, return None as stereo recording is less common
         return None
     
+    def _reply_latency(self, item: Any) -> dict[str, float] | None:
+        """This reply's own LLM time to first token and TTS time to first byte, from its message metrics
+        (LiveKit 1.8); the running averages on SDKs that don't report them."""
+        metrics = _item_metrics(item)
+        ttft, ttfb = metrics.get("llm_node_ttft"), metrics.get("tts_node_ttfb")
+        if not isinstance(ttft, (int, float)) and not isinstance(ttfb, (int, float)):
+            return self._get_turn_latency("assistant")
+        llm_ms = ttft * 1000 if isinstance(ttft, (int, float)) else 0
+        tts_ms = ttfb * 1000 if isinstance(ttfb, (int, float)) else 0
+        return {"llm_ms": llm_ms, "tts_ms": tts_ms, "total_ms": llm_ms + tts_ms}
+
+    def _finish_transcript(self, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Order the turns, work out each reply's wait, and drop caller times a realtime model only stands in for."""
+        if all(isinstance(t.get("start_time_ms"), (int, float)) for t in turns):
+            turns.sort(key=lambda t: t["start_time_ms"])
+        caller_real = self._caller_real()
+        answered = None
+        for turn in turns:
+            if turn["speaker"] != "assistant":
+                continue
+            turn["response_delay_ms"] = None
+            start = turn.get("start_time_ms")
+            if not caller_real or start is None:
+                continue
+            # the caller turn it answers: the last one that ended before it started; a second reply gets none
+            last = max((u for u in turns if u["speaker"] == "user" and u.get("end_time_ms") is not None
+                        and u["end_time_ms"] <= start), key=lambda u: u["end_time_ms"], default=None)
+            if last is not None and last is not answered:
+                turn["response_delay_ms"] = start - last["end_time_ms"]
+                answered = last
+        out = []
+        for turn in turns:
+            turn = {k: v for k, v in turn.items() if not k.startswith("_")}
+            if turn["speaker"] == "user" and not caller_real:
+                turn.update(start_time_ms=None, end_time_ms=None, start_timestamp=None, end_timestamp=None)
+            out.append(turn)
+        return out
+
+    def _caller_real(self) -> bool:
+        """Whether the caller turns' times are real: always outside realtime; there, see _caller_times_real."""
+        return not self._realtime or self._session is None or _caller_times_real(self._session)
+
+    def _realtime_timed(self) -> bool:
+        """Whether reply latencies can be sent: always outside realtime; there, only for _model_times_real models,
+        named by the session or, when the model sits where it can't see, by the realtime metrics."""
+        names = (_attr_safe(_attr_safe(m, "metadata"), "model_name") for m in self._realtime_responses.values())
+        return not self._realtime or self._session is None or _model_times_real(self._session, *names)
+
     def _get_turn_latency(self, speaker: str) -> dict[str, float] | None:
         """Get turn-level latency breakdown if available."""
         if speaker == "assistant":
@@ -2210,6 +2471,11 @@ class WebhookHandler:
     
     def _get_confidence_score(self, item: ChatMessage) -> float | None:
         """Get confidence score if available from the message item."""
+        # LiveKit 1.8 puts the STT's confidence on the caller's message
+        confidence = getattr(item, "transcript_confidence", None)
+        if isinstance(confidence, (int, float)) and 0 <= confidence <= 1:
+            return float(confidence)
+
         # Check if the item has confidence information
         if hasattr(item, 'confidence') and item.confidence is not None:
             return float(item.confidence)

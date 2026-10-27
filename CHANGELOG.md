@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-10-27
+
+Found by end-to-end calls on real models (a cascade, GPT Realtime and Mini, Grok, Gemini Live, Nova Sonic, GPT Live; handoffs, tool errors, Hindi), each value checked against LiveKit's own events and the caller's clock. Cascaded agents change too: these are fixes to values they already sent.
+
+### Added
+- Handoffs: every turn carries `agent_id`, the agent that was running, and `metadata.agents` lists each agent with its instructions when more than one ran (`system_prompt` is still the first agent's).
+- Test-call (eval) payload: each caller line's `language` as the STT heard it, `configuration.stt.language` (the language the STT was set to), and `diagnostics.agent_handoffs` with when each happened.
+
+### Fixed
+- Usage reports are counted once each, not once per request ID: streamed STT sends many reports on one ID, so a 65 s call counted 5 s of audio, and Nova Sonic counted 22 of 1641 input tokens.
+- One caller message is one caller turn. STT finals no longer split it into pieces with 0 ms times; finals that arrive late, or after the reply started, stay in their turn. It starts and ends where LiveKit's voice detector saw the caller (`started_speaking_at`, `stopped_speaking_at`), not at the speaking-state change about 0.5 s later.
+- `response_delay_ms` runs from the end of the caller turn the reply answers to the reply starting. It is never negative (cut-off replies sent −2697 ms), never counts from the caller turn's start, and a second reply to the same caller turn (after a tool call) gets none.
+- A cascaded reply's `turn_latency` is its own LLM time to first token and TTS time to first byte (LiveKit 1.8 message metrics), not the average of every reply so far.
+- `confidence_score` reads LiveKit 1.8's `transcript_confidence` (it was always null); a realtime model's stand-in 1.0 is dropped.
+- Models that only stand in for the caller's times (Gemini Live, Nova Sonic, GPT Live, unless the code gives the session a VAD) send no number that can't be measured: caller line times, reply waits, `turn_latency`, `latency.llm_ms` / `total_ms` / `e2e_ms` and the caller-based `speech_stats` (caller talk time, talk ratio, silence) are null. LiveKit reports their time to first token as −1, 0 or a few milliseconds. The model is read from the session, else from the realtime metrics.
+- `speech_stats.avg_response_delay_ms` and `max_response_delay_ms` are null when no reply has a wait, not 0.
+- Provider labels: LiveKit Inference names (`vendor/model`) give the vendor, `amazon.*` is `aws` (Nova Sonic was `cartesia`), Grok is `xai` (was `openai`). `errors[].source_provider` names the vendor when the model is known.
+- A realtime model's voice is sent as `tts_voice_id`.
+- Eval mode names a realtime model, not the helper model its usage lists (GPT Live).
+
+## [0.3.3] - 2026-10-27
+
+Realtime (speech-to-speech) models only. Cascaded (STT, LLM, TTS) agents send exactly what they did before: no new fields and the same values.
+
+### Added
+- Each agent turn carries `provider_request_id`, the provider's ID for that reply from LiveKit's message metrics. It links the turn to its response and to the provider's own trace.
+- `speech_stats.speech_created_count` (replies LiveKit started, greeting included) and `speech_stats.cancelled_responses` (responses the model reported as cancelled).
+
+### Fixed
+- A reply's `turn_latency.llm_ms` is that reply's own time to first token, found by its provider request ID, instead of the average of every reply so far. On a recorded GPT Realtime 2.1 call the third reply went out as 1434 ms but took 986 ms. It is 0 (not measured) when the response is unknown, reports no time (Gemini 3.1 Flash Live, Phonic), or shares its ID with other responses (Nova Sonic, GPT Live).
+
 ## [0.3.2] - 2026-10-21
 
 ### Added

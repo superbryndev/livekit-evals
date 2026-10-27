@@ -243,7 +243,9 @@ class _TestCall:
         # the caller's turns from the session's user states, for a caller line LiveKit ended at the close
         states = speech if speech is not None else (_section("caller_speech", _caller_speech, events) or [])
         closed = self.closed_at if self.closed_at is not None else time.time()
-        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times, closed, states)
+        transcript, tool_calls = _history_payload(items, base, speech, stand_in, caller_times, closed, states,
+                                                  _section("languages", _caller_languages, events) or {})
+        handoffs = _section("agent_handoffs", _agent_handoffs, items, base)
         llm_requests = _section("llm_requests", _llm_requests, requests, events, items, base)
         # failures come from the session's event record; an SDK without one can't say there were none
         errors = _section("errors", _errors, events, base) if recorded is not None else None
@@ -256,6 +258,9 @@ class _TestCall:
             "diagnostics": _section("diagnostics", _diagnostics, self.session, items, transcript, self.tools_seen,
                                     self.turn_detection, llm_requests, errors, requests, speech, self.interruptions),
         }))
+        if handoffs:  # stored with the diagnostics: each change of agent during the call
+            body["diagnostics"] = {**(body.get("diagnostics") or {}),
+                                   "agent_handoffs": _strict_json("agent_handoffs", handoffs)}
         _, answer = await _send("POST", self.base_url + _AGENT_DATA_PATH, self.api_key, body,
                                 timeout=_ENDED_TIMEOUT_S)
         self._read_answer("call.ended", answer)
@@ -517,10 +522,36 @@ def _time_base(items: list[Any], starts: Iterable[float] = ()) -> float:
     return min(stamps) if stamps else 0.0
 
 
+def _caller_languages(events: list[Any]) -> dict[str, str]:
+    """The language the STT heard for each caller message, by item ID, from its final transcripts."""
+    languages: dict[str, str] = {}
+    for event in events:
+        if _attr(event, "type") == "user_input_transcribed" and _attr(event, "is_final"):
+            item_id, language = _attr(event, "item_id"), _attr(event, "language")
+            if isinstance(item_id, str) and language:
+                languages[item_id] = _cut(str(language), _MAX_NAME)
+    return languages
+
+
+def _agent_handoffs(items: list[Any], base: Optional[float]) -> list[dict[str, Any]]:
+    """Each change of agent during the call (the first agent's start is not one), ms from base."""
+    out = []
+    for item in items:
+        if _attr(item, "type") == "agent_handoff" and _attr(item, "old_agent_id"):
+            at = _attr(item, "created_at")
+            out.append(_compact({
+                "old_agent_id": _cut(str(_attr(item, "old_agent_id")), _MAX_NAME),
+                "new_agent_id": _cut(str(_attr(item, "new_agent_id")), _MAX_NAME),
+                "at_ms": max(0, int(round((at - base) * 1000))) if _is_num(at) and _is_num(base) else None,
+            }))
+    return out
+
+
 def _history_payload(items: list[Any], base: Optional[float] = None,
                      speech: Optional[list[tuple[float, Optional[float]]]] = None, stand_in_confidence: bool = False,
                      caller_times: bool = True, closed_at: Optional[float] = None,
                      caller_states: Optional[list[tuple[float, Optional[float]]]] = None,
+                     languages: Optional[dict[str, str]] = None,
                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Contract turns and tool calls from the history items; ms are from base (by default the history's first moment).
     speech is set for a realtime model: caller lines take their times from it. LiveKit's 1.0 stand-in confidence is
@@ -562,6 +593,7 @@ def _history_payload(items: list[Any], base: Optional[float] = None,
                     "start_ms": ms(start),
                     "end_ms": ms(end),
                     "confidence": confidence if user and _is_num(confidence) and 0 <= confidence <= 1 else None,
+                    "language": (languages or {}).get(_attr(item, "id")) if user else None,
                     "interrupted": None if user else bool(getattr(item, "interrupted", False)),
                 }))
                 if not user:
@@ -664,13 +696,17 @@ def _component(session: Any, kind: str, usage: list[Any]) -> dict[str, str]:
     entries = _of_type(usage, f"{kind}_usage")
     fields = {key: _first_name(_attr(base, key), *(_attr(e, key) for e in entries))
               for key in ("provider", "model")}
-    top = max(entries, key=_tokens, default=None) if kind == "llm" else None
+    # a realtime model is the model that ran; usage may name its helper model (GPT Live's delegated LLM)
+    top = max(entries, key=_tokens, default=None) if kind == "llm" and not isinstance(base, llm.RealtimeModel) else None
     if top is not None and _tokens(top) > 0 and _name(_attr(top, "model")) not in (None, fields["model"]):
         fields = {key: _name(_attr(top, key)) for key in ("provider", "model")}
     if kind == "tts":
         opts = _attr(base, "_opts")
         fields["voice"] = _first_name(_attr(base, "voice_id"), _attr(base, "voice"),
                                       _attr(opts, "voice_id"), _attr(opts, "voice"))
+    if kind == "stt":
+        # the language the STT was set to ("multi", "hi", "en-US"), when it says
+        fields["language"] = _first_name(_attr(_attr(base, "_opts"), "language"), _attr(base, "language"))
     return _compact(fields)
 
 
@@ -683,13 +719,19 @@ def _caller_times_real(session: Any) -> bool:
     """Whether a realtime session's caller start and stop times are real: with a VAD the code gave the agent or the
     session they are LiveKit's own; without, only for the models in _REAL_CALLER_STOPS. Quietly False when the model
     can't be read."""
-    if _given_vad(session):
-        return True
+    return _given_vad(session) or _model_times_real(session)
+
+
+def _model_times_real(session: Any, *other_names: Any) -> bool:
+    """Whether the realtime model is one in _REAL_CALLER_STOPS, whose own response timings are real too; the others
+    report a ttft of -1, 0 or a few ms. other_names name it when the session can't (its realtime metrics). Quietly
+    False when no name can be read."""
     try:
-        model = (_component(session, "llm", []).get("model") or "").lower()
+        model = _component(session, "llm", []).get("model") or ""
     except Exception:  # noqa: BLE001
-        return False
-    return any(name in model for name in _REAL_CALLER_STOPS)
+        model = ""
+    names = [model, *(n for n in other_names if isinstance(n, str))]
+    return any(stop in name.lower() for name in names for stop in _REAL_CALLER_STOPS)
 
 
 _UNSET = object()
