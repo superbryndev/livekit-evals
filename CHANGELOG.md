@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-28
+
+One entry point and one report per call. `attach(ctx, session)` replaces both 0.3.x paths (`create_webhook_handler`
+for production calls and `attach_test_data` for SuperBryn test calls) and posts one body to
+`/public-api/v1/calls/agent-data`. This is a breaking change: see "Upgrading from 0.3.x" below and in the README.
+
+### Added
+- `attach(ctx, session, *, api_key, agent_id, production=True, record=True, custom_data, prompt, prompt_version, base_url)`,
+  called once per job before `session.start()`; it registers its own shutdown hook and returns the call's handle:
+  `set_custom_data()`, `update_custom_data()`, `set_call_end_reason()` and `set_recording_url()`.
+- A `surface` per call: a SuperBryn test call (recognised as 0.3.x did: `superbryn_call_id` in the job or room
+  metadata, the `X-SuperBryn-Call-Id` SIP header, or SuperBryn's caller number) is `testing`; every other call is
+  `observability`, unless `production=False`, which sends nothing for it. Each call is reported once, as
+  `call.started` (identity only) and `call.ended` from the job's shutdown after the hang-up (its work finishes within
+  8 s), with 0.3.x's retries and the same `event_id` on each. A console run (`agent.py console`) sends nothing.
+- Production calls are recorded in stereo (the agent on one channel, the caller on the other; 0.3.x recorded mono
+  unless `stereo_recording=True`, and `record=False` turns it off in place of `disable_recording=True`) and send
+  `observability.recording_url`, `stereo_recording_url`, `recording_url_source` and `direction`. Test calls are not
+  recorded.
+- Both surfaces: `transcript[].provider_request_id` on agent lines; `diagnostics.errors[].source_model` and
+  `source_provider`; `diagnostics.eou_events[]` (`at_ms`, `eou_delay_ms`, `transcription_delay_ms`);
+  `diagnostics.dtmf[]` (`at_ms`, `digit`); `ended_by` (`agent`, `caller` or `system`); `context` with
+  `system_prompt` (the first agent's instructions as rendered when it became active), `prompt_ref`, `room_name`,
+  `participant_identity`, `ring_started_at`, `environment` and, on a session that closed on an error, `close`;
+  `custom_data` at the top level, exactly as given.
+
+### Changed
+- Fewer requests per call: SuperBryn's caller numbers and the prompt versions already pushed are kept per key in a
+  temp file every job on the host reads (numbers for an hour, prompts for a day), and a key refused the numbers is
+  asked again after an hour, not a minute (an outage still after a minute).
+- Any valid SuperBryn API key reads the caller numbers and sends production calls (as the Monitor webhooks took
+  any key), so keys made before `obs:write` existed keep working; a test call's data still needs `test_data:write`,
+  and without it SuperBryn's phone tests are recognised and kept out of Monitor.
+- Needs livekit-agents 1.6.7 or newer (the oldest release that gives every value this body sends) and Python
+  3.10+, as livekit-agents does; 0.3.x declared livekit-agents 0.8 and Python 3.9.
+- `started_at` is when the caller joined; for an outbound phone call, when `sip.callStatus` turned `active` (or `automation`), so its
+  dialling and ringing are not call time (`context.ring_started_at` keeps when it was dialled). Every `start_ms`,
+  `end_ms` and `at_ms` counts from it. An outbound call that never connected is reported from its dialling,
+  unrecorded, with `ended_reason` `user_unavailable`, `user_rejected`, `sip_trunk_failure` or `not_answered`.
+- Turn latency keys are snake_case: `turn_latencies[]` has `turn_id`, `transcriber_ms`, `endpointing_ms`,
+  `model_ms`, `voice_ms` and `turn_ms`. `superbryn_call_id` moves into the `testing` block. `schema_version` is 1 for
+  this body.
+- One key: `SUPERBRYN_API_KEY` with both `test_data:write` and `obs:write`. `SUPERBRYN_AGENT_ID` (a UUID) is sent
+  when set and optional with an agent key; any other value is left out with one warning instead of disabling
+  reporting. Log lines start with `SUPERBRYN_CALL_REPORT_` (logger `livekit_evals`). The handle's setters never raise:
+  `custom_data` takes any mapping, as 0.3.x did, and a value a setter can't take is left out with a warning. Prompt
+  pushes name the agent (`SUPERBRYN_AGENT_ID`), so an organization key can push them, and a refused push is tried
+  again after an hour instead of on every call.
+
+### Removed
+- `create_webhook_handler`, `WebhookHandler` and `attach_test_data`, the 0.3.x `call{}` body and its route
+  (`/webhooks/obs/livekit`), and the `WEBHOOK_URL`, `AGENT_ID`, `VERSION_ID`, `LIVEKIT_PROJECT_ID`,
+  `SUPERBRYN_TEST_API_KEY` and `SUPERBRYN_CREDENTIALS_URL` settings.
+- Numbers the package worked out and fields SuperBryn no longer reads: `speech_stats`, the latency, turn-detection,
+  interruption and VAD summaries, network and WebRTC stats, absolute per-turn timestamps, SIP attributes, the
+  `*_enabled` flags, `livekit_project_id`, `call_rate_usd`, `speaker_id`, `tokens_per_second` and `total_tokens`,
+  `response_delay_ms`, `recording_url_reachable`, each caller line's `language` (0.3.4; it stayed empty with an
+  STT pipeline), and the handoff fields (per-line `agent_id`, `metadata.agents`,
+  `diagnostics.agent_handoffs`). SuperBryn computes what it needs from the raw records.
+
+### Upgrading from 0.3.x
+Remove `create_webhook_handler`, `attach_to_session`, `ctx.add_shutdown_callback(send_webhook)` and
+`attach_test_data`; add one `report = attach(ctx, session, custom_data=...)` before `session.start()`, with the same
+`custom_data` keys and value types; call `report.set_custom_data()`, `update_custom_data()` and
+`set_call_end_reason()` where you called them on the webhook handler. Put SuperBryn's Agent data key (both permissions) in
+`SUPERBRYN_API_KEY` and remove `SUPERBRYN_TEST_API_KEY`, set `SUPERBRYN_AGENT_ID` to the agent's SuperBryn ID instead of a
+free-form `AGENT_ID` (or drop it with an agent key), drop `WEBHOOK_URL`, and pin `livekit-evals>=0.4.0`. The README
+has a before/after and a prompt that has a coding agent make the change.
+
 ## [0.3.4] - 2026-10-27
 
 Found by end-to-end calls on real models (a cascade, GPT Realtime and Mini, Grok, Gemini Live, Nova Sonic, GPT Live; handoffs, tool errors, Hindi), each value checked against LiveKit's own events and the caller's clock. Cascaded agents change too: these are fixes to values they already sent.

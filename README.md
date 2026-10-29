@@ -1,837 +1,258 @@
 # LiveKit Evals
 
 [![PyPI version](https://badge.fury.io/py/livekit-evals.svg)](https://badge.fury.io/py/livekit-evals)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Track and evaluate your LiveKit voice AI agents with just 3 lines of code.**
+**One line in your LiveKit agent reports every call to SuperBryn.**
 
-Automatically capture transcripts, usage metrics, latency data, and session analytics from your LiveKit agents. Perfect for monitoring, debugging, and optimizing your voice AI applications.
+`attach(ctx, session)` sends your agent's own record of each call: the transcript, tool calls, each reply's latency
+parts, the models and settings that ran, token, audio and character usage, every LLM request and what became of it,
+and every STT, LLM or TTS failure. SuperBryn does every calculation on its side.
 
-## ✨ Features
+- **SuperBryn test calls** are reported for testing (surface `testing`): the agent's record sits next to the test.
+- **Every other call** is a production call (surface `observability`): it is recorded in stereo and appears in
+  Monitor. `production=False` turns production reporting off.
 
-- 🎯 **3-Line Integration** - Add to any LiveKit agent in seconds
-- 📝 **Precise Transcripts** - Accurate timing using VAD state change events
-- 📊 **Usage Metrics** - Track LLM tokens, STT duration, TTS characters
-- ⚡ **Latency Tracking** - Monitor LLM, STT, and TTS performance
-- 🔍 **Auto-Detection** - Automatically extracts models, providers, and configuration
-- 📞 **SIP Support** - Detects SIP trunking and phone numbers
-- 🎥 **Recording URLs** - Captures egress recording links
-- 🎙️ **Call Recordings** - Automatic call recording to S3 (MP3 format, enabled by default, no S3 config needed)
-- 🔊 **Stereo Recording** - Dual-channel recording with agent on left, caller on right (one param)
-- 🗂️ **Custom Data** - Attach arbitrary JSON to every webhook payload via `custom_data`
-- 🔐 **Secure** - API key authentication; temporary S3 credentials fetched per-session
-- ⏱️ **Turn-Detection Latency** - End-of-utterance (EOU) + transcription delays per turn, the hidden part of response latency
-- 🌐 **Network Telemetry** - Connection quality, reconnects, and WebRTC stats (jitter, RTT, packet loss, audio dropouts)
-- 🚨 **Provider Errors** - Typed STT/LLM/TTS failures with recoverability, model, and provider
-- 🗣️ **Conversation Analytics** - Talk ratio, silence, interruptions, backchannels, DTMF keypresses, full SIP attributes
+Each call is reported once, as `call.started` when the caller is in the room (an outbound phone call: once it is
+answered) and `call.ended` when the job shuts down after the hang-up (its shutdown work finishes within 8 seconds). Everything runs in the background: it adds no latency and never raises into your agent.
 
-## 🚀 Quick Start
-
-### Prerequisites
-
-1. **Get your API key** from [https://app.superbryn.com/api-keys](https://app.superbryn.com/api-keys)
-2. **Set environment variable:**
-   ```bash
-   export SUPERBRYN_API_KEY=your_api_key_here
-   ```
-
-### Installation
+## Install
 
 ```bash
-pip install -U "livekit-evals>=0.3.0"
+pip install -U "livekit-evals>=0.4.0"
 ```
 
-### Integration (3 Lines)
-
-Add these lines to your LiveKit agent:
-
-```python
-from livekit_evals import create_webhook_handler
-
-async def entrypoint(ctx: JobContext):
-    # ... your existing setup code ...
-    
-    # 1. Create webhook handler (recording enabled by default)
-    webhook_handler = create_webhook_handler(
-        room=ctx.room,
-        is_deployed_on_lk_cloud=True,  # Set to False if self-hosting
-        # disable_recording=True  # Uncomment to disable call recording
-    )
-    
-    # ... create your session ...
-    session = AgentSession(
-        llm=openai.LLM(model="gpt-4o-mini"),
-        stt=deepgram.STT(model="nova-3"),
-        tts=cartesia.TTS(voice="..."),
-    )
-    
-    # ... your session setup ...
-    await session.start(agent=YourAgent(), room=ctx.room)
-    
-    # 2. Attach to session (MUST be after session.start)
-    if webhook_handler:
-        webhook_handler.attach_to_session(session)
-        # 3. Send webhook on shutdown
-        ctx.add_shutdown_callback(webhook_handler.send_webhook)
-    
-    await ctx.connect()
-```
-
-**That's it!** 🎉 Your agent will now automatically track all session data and send it to your webhook endpoint.
-
-## 📖 Full Example
-
-Here's a complete working example:
-
-```python
-import logging
-from dotenv import load_dotenv
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    WorkerOptions,
-    cli,
-)
-from livekit.plugins import cartesia, deepgram, openai, silero
-
-# Import livekit-evals
-from livekit_evals import create_webhook_handler
-
-logger = logging.getLogger("agent")
-load_dotenv()
-
-
-class Assistant(Agent):
-    def __init__(self) -> None:
-        super().__init__(
-            instructions="""You are a helpful voice AI assistant.
-            You eagerly assist users with their questions.""",
-        )
-
-
-async def entrypoint(ctx: JobContext):
-    # Logging setup
-    ctx.log_context_fields = {"room": ctx.room.name}
-
-    # Initialize webhook handler (auto-detects all metadata)
-    webhook_handler = create_webhook_handler(
-        room=ctx.room,
-        is_deployed_on_lk_cloud=True  # Set to False if self-hosting
-    )
-
-    # Set up voice AI pipeline
-    session = AgentSession(
-        llm=openai.LLM(model="gpt-4o-mini"),
-        stt=deepgram.STT(model="nova-3", language="en"),
-        tts=cartesia.TTS(voice="your-voice-id"),
-        vad=silero.VAD.load(),
-    )
-
-    # Start the session
-    await session.start(agent=Assistant(), room=ctx.room)
-
-    # Attach webhook handler to capture events
-    # IMPORTANT: Must be after session.start()
-    if webhook_handler:
-        webhook_handler.attach_to_session(session)
-        ctx.add_shutdown_callback(webhook_handler.send_webhook)
-
-    # Connect to room
-    await ctx.connect()
-
-
-if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-```
-
-## 🔧 Configuration
-
-### Environment Variables
-
-| Variable | Required | Description | Default |
-|----------|----------|-------------|---------|
-| `SUPERBRYN_API_KEY` | ✅ Yes | API key for webhook authentication and call recording | - |
-| `LIVEKIT_PROJECT_ID` | ⚪ Optional | LiveKit project ID | Auto-detected from `LIVEKIT_URL` |
-| `AGENT_ID` | ⚪ Optional | Unique agent identifier | `"livekit-agent"` |
-| `VERSION_ID` | ⚪ Optional | Agent version identifier | `"v1"` |
-
-**Note:** Call recording is **enabled by default**. Temporary S3 credentials are fetched automatically using your `SUPERBRYN_API_KEY` -- no S3 configuration needed.
-
-### Setting Environment Variables
-
-**Linux/Mac:**
-```bash
-export SUPERBRYN_API_KEY=your_api_key_here
-```
-
-**Windows (CMD):**
-```cmd
-set SUPERBRYN_API_KEY=your_api_key_here
-```
-
-**Windows (PowerShell):**
-```powershell
-$env:SUPERBRYN_API_KEY="your_api_key_here"
-```
-
-**Docker:**
-```bash
-docker run -e SUPERBRYN_API_KEY=your_api_key_here ...
-```
-
-**.env file:**
-```env
-SUPERBRYN_API_KEY=your_api_key_here
-LIVEKIT_PROJECT_ID=my-project-id
-AGENT_ID=my-agent
-VERSION_ID=v1.0.0
-```
-
-## 📊 What Gets Tracked
-
-### Transcript Data
-- **Precise timing** using VAD state change events
-- Speaker turns (user/assistant)
-- Start/end timestamps (ISO 8601)
-- Start/end times in milliseconds (relative to call start)
-- Response delays between turns
-- Interruption detection
-- Confidence scores (when available)
-- Language detection
-- Speaker IDs
-
-### Tool Calls
-- **Function name** and raw JSON arguments for every tool invoked by the agent
-- **Tool result** (output string) paired with each call
-- **Error flag** (`is_error`) when the tool execution raised an exception
-- **Timing** — `start_ms` (call dispatched) and `end_ms` (result received), both as ms offsets from call start
-
-### Usage Metrics
-- **LLM:** Input tokens, output tokens, total tokens, model, provider
-- **STT:** Audio duration, model, provider
-- **TTS:** Character count, audio duration, model, provider, voice ID
-
-### Latency Metrics
-- **LLM:** Time to first token (TTFT), total duration
-- **STT:** Processing duration
-- **TTS:** Time to first byte (TTFB), total duration
-- **Aggregated:** Average latencies per component
-
-### Session Metadata
-- Agent ID and version
-- LiveKit project ID
-- System prompt
-- Call duration
-- Phone number (if SIP call)
-- SIP trunking detection
-- Egress recording URLs
-- LiveKit Cloud deployment status
-
-### Extended Telemetry (on by default)
-
-Everything below ships as **additive** sections in the same payload — all previously existing
-fields are unchanged. Disable with `extended_capture=False` for the legacy shape.
-Older livekit-agents versions simply produce fewer fields (each capture is
-feature-detected; nothing breaks).
-
-| Section | What's inside |
-|---------|---------------|
-| `call.turn_detection` | Per-turn end-of-utterance delay, transcription delay, end-of-turn model inference stats |
-| `call.latency` (new keys) | `eou_ms`, `transcription_ms`, `e2e_ms` (EOU + LLM TTFT + TTS TTFB — true perceived latency) |
-| `call.speech_stats` | User/agent talk seconds, turn counts, talk ratio, silence, longest gap, response delays; realtime models also `speech_created_count` and `cancelled_responses` |
-| `call.transcript.turns[]` (realtime models) | Agent turns carry `provider_request_id`, and `turn_latency.llm_ms` is that reply's own time to first token (0 when not measured) |
-| `call.interruptions` | Interrupted agent turns, false interruptions, detected interruptions + backchannels (SDK ≥1.6) |
-| `call.network` | Connection quality timeline, reconnects, disconnect reasons, WebRTC stats polled every 10s (jitter, RTT, packet loss %, concealed samples, NACKs, bytes) |
-| `call.errors` | Typed provider failures (`stt_error`/`llm_error`/`tts_error`), message, `recoverable`, model, provider |
-| `call.close` | LiveKit's own close reason + terminal error (separate from your `call_end_reason`) |
-| `call.sip` | Full `sip.*` attribute snapshot + DTMF keypresses with timestamps |
-| `call.vad` | VAD inference count/latency and idle time |
-| `call.environment` | livekit-agents / livekit / livekit-evals / Python versions, RTC stats support flag |
-| `call.usage` (new keys) | LLM cached prompt tokens + tokens/sec, STT/TTS connection acquire times, realtime-model audio/text/cached token splits |
-
-Example of the extended sections:
-
-```json
-{
-  "call": {
-    "latency": { "llm_ms": 450.5, "stt_ms": 120.3, "tts_ms": 180.7, "total_ms": 751.5,
-                 "eou_ms": 420.0, "transcription_ms": 95.0, "e2e_ms": 1051.2 },
-    "turn_detection": {
-      "avg_eou_delay_ms": 420.0, "max_eou_delay_ms": 610.2, "avg_transcription_delay_ms": 95.0,
-      "eot_inference_count": 14, "avg_eot_prediction_ms": 81.5,
-      "eou_events": [ { "timestamp_ms": 5210, "eou_delay_ms": 402.1, "transcription_delay_ms": 88.0, "on_user_turn_completed_delay_ms": 1.2 } ]
-    },
-    "speech_stats": {
-      "user_talk_seconds": 41.2, "agent_talk_seconds": 88.6, "user_turn_count": 12, "agent_turn_count": 13,
-      "avg_user_turn_seconds": 3.4, "avg_agent_turn_seconds": 6.8, "agent_talk_ratio": 0.683,
-      "silence_seconds": 20.2, "longest_silence_ms": 4100,
-      "avg_response_delay_ms": 910.4, "max_response_delay_ms": 2210.0
-    },
-    "interruptions": { "agent_turns_interrupted": 2, "false_interruptions": 0,
-                       "detected_interruptions": 2, "backchannels": 5, "detection_delay_ms": 150.0 },
-    "network": {
-      "worst_connection_quality": "poor",
-      "connection_quality_events": [ { "timestamp_ms": 61200, "participant": "+12025551234", "quality": "poor" } ],
-      "reconnect_count": 1,
-      "connection_events": [ { "type": "reconnecting", "timestamp_ms": 63400 }, { "type": "reconnected", "timestamp_ms": 64100 } ],
-      "track_subscription_failures": 0,
-      "room_disconnect_reason": "client_initiated",
-      "rtc": {
-        "summary": { "samples_collected": 15, "avg_jitter_ms": 12.0, "max_jitter_ms": 41.5,
-                     "avg_rtt_ms": 70.0, "max_rtt_ms": 180.2, "packets_received": 14200, "packets_lost": 36,
-                     "packet_loss_pct": 0.25, "concealed_samples": 4800, "silent_concealed_samples": 1200,
-                     "nack_count": 6, "bytes_received": 2400000, "bytes_sent": 2300000,
-                     "avg_jitter_buffer_delay_ms": 42.1, "remote_fraction_lost_max": 0.02 },
-        "samples": [ { "t_ms": 10000, "jitter_ms": 9.5, "rtt_ms": 65.0, "packets_lost": 4 } ]
-      }
-    },
-    "errors": [ { "timestamp_ms": 84200, "error_type": "stt_error", "message": "deepgram websocket closed: 1011",
-                  "recoverable": true, "label": "deepgram.STT", "source_model": "nova-3", "source_provider": "deepgram" } ],
-    "close": { "reason": "participant_disconnected", "error_type": null, "error_message": null },
-    "sip": { "attributes": { "sip.callID": "abc-123", "sip.callStatus": "hangup", "sip.phoneNumber": "+12025551234" },
-             "dtmf": [ { "timestamp_ms": 32000, "digit": "1", "code": 1 } ] },
-    "vad": { "inference_count": 4210, "avg_inference_ms": 1.9, "total_inference_seconds": 8.1, "idle_time_seconds": 3.2 },
-    "environment": { "livekit_evals_version": "0.2.14", "livekit_agents_version": "1.6.5",
-                     "livekit_rtc_version": "1.1.13", "python_version": "3.12.12", "rtc_stats_supported": true }
-  }
-}
-```
-
-## 🔍 How It Works
-
-1. **Event Listening:** Attaches to LiveKit session events (`user_state_changed`, `agent_state_changed`, `conversation_item_added`) and to the per-plugin `metrics_collected` events on STT/LLM/TTS (the non-deprecated metrics surface), with `session_usage_updated` as a fallback for realtime models. With extended capture (default) it also listens to the session `error` / `agent_false_interruption` events, the session-level `metrics_collected` re-emit (the only surface carrying VAD/EOU/interruption metrics — a one-line deprecation warning in logs is expected), room events (`connection_quality_changed`, `reconnecting`/`reconnected`, `sip_dtmf_received`, `participant_attributes_changed`, ...), and polls `room.get_rtc_stats()` every 10s
-2. **Data Aggregation:** Collects and processes events during the session
-3. **Auto-Detection:** Extracts configuration from session objects
-4. **Webhook Delivery:** Sends comprehensive payload to webhook endpoint when session ends
-
-### Webhook Payload Format
-
-```json
-{
-  "event": "call.ended",
-  "call": {
-    "id": "room-name",
-    "room_name": "room-name",
-    "participant_identity": "user-123",
-    "started_at": "2025-10-19T12:00:00.000Z",
-    "ended_at": "2025-10-19T12:05:30.000Z",
-    "duration_seconds": 330,
-    "transcript": {
-      "turns": [
-        {
-          "speaker": "user",
-          "text": "Hello, how are you?",
-          "timestamp": "2025-10-19T12:00:05.000Z",
-          "start_timestamp": "2025-10-19T12:00:05.000Z",
-          "end_timestamp": "2025-10-19T12:00:07.000Z",
-          "start_time_ms": 5000,
-          "end_time_ms": 7000,
-          "interrupted": false,
-          "confidence_score": 0.98,
-          "language": "en"
-        },
-        {
-          "speaker": "assistant",
-          "text": "I'm doing great, thanks for asking!",
-          "timestamp": "2025-10-19T12:00:08.000Z",
-          "start_timestamp": "2025-10-19T12:00:08.000Z",
-          "end_timestamp": "2025-10-19T12:00:11.000Z",
-          "start_time_ms": 8000,
-          "end_time_ms": 11000,
-          "response_delay_ms": 1000,
-          "interrupted": false
-        }
-      ]
-    },
-    "tool_calls": [
-      {
-        "id": "call_abc123",
-        "function_name": "book_appointment",
-        "arguments": "{\"date\": \"2026-06-20\", \"time\": \"10:00\"}",
-        "result": "{\"confirmation_id\": \"APT-9001\", \"status\": \"confirmed\"}",
-        "is_error": false,
-        "start_ms": 12500,
-        "end_ms": 13800,
-        "timestamp_ms": 12500
-      }
-    ],
-    "recording_url": "https://...",
-    "stereo_recording_url": "https://...",
-    "metadata": {
-      "agent_id": "my-agent",
-      "livekit_project_id": "my-project",
-      "llm_model": "gpt-4o-mini",
-      "llm_provider": "openai",
-      "stt_model": "nova-3",
-      "stt_provider": "deepgram",
-      "tts_model": "sonic-english",
-      "tts_provider": "cartesia",
-      "tts_voice_id": "...",
-      "system_prompt": "You are a helpful assistant...",
-      "sip_trunking_enabled": false,
-      "egress_enabled": true,
-      "lk_agent_enabled": true,
-      "phone_number": null
-    },
-    "usage": {
-      "llm_model": "gpt-4o-mini",
-      "llm_provider": "openai",
-      "llm_input_tokens": 1250,
-      "llm_output_tokens": 850,
-      "llm_total_tokens": 2100,
-      "stt_provider": "deepgram",
-      "stt_model": "nova-3",
-      "stt_duration_seconds": 45.2,
-      "audio_duration_seconds": 45.2,
-      "tts_provider": "cartesia",
-      "tts_model": "sonic-english",
-      "tts_characters": 1200,
-      "tts_audio_duration_seconds": 42.5
-    },
-    "latency": {
-      "llm_ms": 450.5,
-      "stt_ms": 120.3,
-      "tts_ms": 180.7,
-      "total_ms": 751.5
-    },
-    "custom_data": {
-      "ticket_id": "TKT-9001",
-      "customer_tier": "enterprise"
-    }
-  }
-}
-```
-
-## 🛠️ Advanced Usage
-
-### Prompt Sync
-
-Keeps SuperBryn in step with the prompt your agent runs. Pass the prompt template (placeholders unfilled):
-
-```python
-PROMPT = "You are a helpful voice AI assistant for {{company}}."
-
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    prompt=PROMPT,            # the template your agent runs
-    prompt_version="v13",     # optional: your label for this version
-)
-```
-
-- Every call carries `metadata.prompt_ref = {"hash": "sha256:...", "version": "v13"}`, and the template's text is pushed to SuperBryn once per process per version (`POST /public-api/v1/prompts`).
-- When you deploy a changed prompt, the agent's settings in SuperBryn show the change and offer to make it a new version. A prompt saved but never deployed never shows up, because no call names it.
-- Prompt sync never holds the webhook back: if the push fails, the call is still sent and is matched once the prompt text arrives.
-- The API key needs the `obs:write` scope. Keys generated in Monitor > Configure have it; with an older key a `SUPERBRYN_PROMPT_SYNC_FORBIDDEN` warning is logged once.
-- Without `prompt=`, the agent's instructions are sent as `metadata.system_prompt` (as before) and read as rendered text, so a change shows up after a few calls instead of one.
-- `first_message=` and `prompt_tools=[{"name", "description", "parameters"}]` are pushed with the prompt. `sync_prompt=False` turns it off.
-
-### Disabling Extended Capture
-
-Extended telemetry (turn detection, network stats, errors, SIP detail, ...) is
-on by default and adds no meaningful overhead — network stats are polled once
-every 10 seconds and everything else is passive event listening. To emit the
-exact legacy payload instead:
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    extended_capture=False,  # legacy payload shape only
-)
-```
-
-### Custom Data
-
-Attach any JSON-serializable fields to the webhook payload using `custom_data`. These are forwarded verbatim in `payload["call"]["custom_data"]` and are never interpreted by the package — they're purely for your own downstream use.
-
-**At creation time** (data known at session startup):
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    custom_data={
-        "ticket_id": "TKT-9001",
-        "customer_tier": "enterprise",
-        "lead_source": "website",
-    },
-)
-```
-
-**During the session** (data discovered at runtime, e.g. after a tool call):
-
-```python
-# Replace the entire dict
-webhook_handler.set_custom_data({"resolved": True, "resolution_code": "answered"})
-
-# Or merge additional keys while keeping existing ones
-webhook_handler.update_custom_data({"appointment_booked": True, "slot": "2026-06-05T10:00"})
-```
-
-Both methods can be called at any point before `send_webhook()` fires on shutdown.
-
-### Custom API Key
-
-Pass API key directly instead of using environment variable:
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    api_key="your_api_key_here"
-)
-```
-
-### Custom LiveKit Project ID
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    livekit_project_id="my-custom-project-id"
-)
-```
-
-### Self-Hosted Agents
-
-If you're self-hosting your LiveKit agents (not using LiveKit Cloud):
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=False  # Important for cost calculation
-)
-```
-
-### Custom Telephony Rates
-
-If you're using custom telephony providers (Twilio, Vonage, etc.) with specific per-minute rates:
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    call_rate_usd=0.015  # Your custom rate per minute ($/min)
-)
-```
-
-This overrides default provider costs and ensures accurate cost tracking for your telephony usage.
-
-### Call Recording (Enabled by Default)
-
-Call recording is **automatically enabled**. Recordings are:
-- ✅ MP3 format (universal compatibility)
-- ✅ Publicly accessible via direct URL
-- ✅ Secured with short-lived credentials (30-minute expiry, scoped per session)
-- ✅ Automatically included in webhook payload
-
-No S3 keys, buckets, or regions need to be configured -- the package fetches
-temporary upload credentials from SuperBryn's credentials service using your
-`SUPERBRYN_API_KEY`.
-
-**Recording URLs** are included in the webhook payload:
-
-```json
-{
-  "call": {
-    "recording_url": "https://superbryn-call-recordings.s3.ap-south-1.amazonaws.com/call_recordings/+12025551234/20250106-153045/call.mp3"
-  }
-}
-```
-
-**To disable recording:**
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    disable_recording=True  # Disable call recording
-)
-```
-
-### Bring Your Own Egress (External Recording URL)
-
-If you already run your **own** egress, you can disable SuperBryn's recording and
-supply your own recording URL instead. Disable our egress with
-`disable_recording=True`, then call `set_external_recording_url()` once your
-recording is ready (any time before the webhook fires on shutdown):
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    disable_recording=True,  # don't start SuperBryn's egress
-)
-
-# ... later, once your own egress has produced a file ...
-reachable = await webhook_handler.set_external_recording_url(
-    "https://my-bucket.s3.amazonaws.com/calls/room-123/call.mp3?X-Amz-Signature=...",
-    # probe=False,  # skip the call-time reachability check
-)
-```
-
-**Only public or pre-signed URLs are supported.** When you call this method the
-URL is validated at call time with a lightweight ranged GET (`Range: bytes=0-0`):
-
-- `200`/`206` → reachable; the URL is marked usable for mirroring.
-- `401`/`403` → private object or bad/expired signature — a clear error is logged
-  and mirroring should be skipped.
-- `404` → object not uploaded yet or wrong path (a timing/path issue).
-
-> A ranged **GET** is used instead of `HEAD` because S3 pre-signed URLs are signed
-> for a single HTTP method — a `HEAD` on a GET-signed URL returns `403` and would
-> falsely look private. Note the check reflects reachability *at call time*; a
-> pre-signed URL can still expire before a later (e.g. server-side) mirror runs,
-> so sign for a long-enough TTL or mirror promptly.
-
-The webhook payload gains two fields so the consumer can decide whether to mirror:
-
-```json
-{
-  "call": {
-    "recording_url": "https://my-bucket.s3.amazonaws.com/.../call.mp3?...",
-    "recording_url_source": "external",     // "superbryn_s3" for the managed flow
-    "recording_url_reachable": true          // call-time probe result (null if not probed)
-  }
-}
-```
-
-For the default managed flow these are `"superbryn_s3"` / `true` — the file is
-already in SuperBryn's bucket and needs no mirroring.
-
-### Stereo Recording (Dual-Channel)
-
-Record in dual-channel stereo where the **agent is on the left channel** and **all other participants (caller/SIP) are on the right channel**. This is useful for separate-speaker transcription and analysis.
-
-Stereo is **opt-in** — the default is mono. Enabling it is a **one-line change**: add `stereo_recording=True`. There is nothing else to configure or install — it reuses the exact same recording pipeline (egress + S3 credentials), just switching the egress to `DUAL_CHANNEL_AGENT` mixing instead of a mono mix.
-
-```python
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True,
-    stereo_recording=True  # L=agent, R=caller
-)
-```
-
-**Prerequisites:** the only requirement is that recording already works for you (i.e. you currently get a `recording_url` in your webhook payload). That requires:
-- `SUPERBRYN_API_KEY` set (used to fetch temporary S3 credentials — no S3 config needed)
-- LiveKit Egress available on your deployment (enabled by default on LiveKit Cloud; the egress service must be running if self-hosted)
-- Standard LiveKit env vars (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`)
-
-If recording works today, `stereo_recording=True` is the **only** change needed — no version bump, no new dependency. `stereo_recording=True` also implies recording is enabled (it overrides `disable_recording`).
-
-When stereo is enabled, both `recording_url` and `stereo_recording_url` are populated in the webhook payload. **Note:** a single MP3 file is written — the stereo separation lives in the file's two channels, so both fields point to the *same* URL:
-
-```json
-{
-  "call": {
-    "recording_url": "https://...call.mp3",
-    "stereo_recording_url": "https://...call.mp3"
-  }
-}
-```
-
-If you need to stop the recording before deleting the room (e.g. in a graceful shutdown), call `stop_egress()` to ensure the file is finalized on S3:
-
-```python
-await webhook_handler.stop_egress()  # finalize recording before room deletion
-```
-
-### Semantic Call End Reasons
-
-If your agent knows the **business reason** for ending a call, set it explicitly on
-the `WebhookHandler` before closing the room. This helps preserve reasons such as
-`transfer_to_human`, `conversation_complete`, `caller_hung_up`, or
-`no_answer_timeout` in the final webhook payload.
-
-Without this, LiveKit may only emit a generic close reason like "participant left"
-or "session closed".
-
-```python
-# Example: transfer to human
-webhook_handler.set_call_end_reason("transfer_to_human")
-await webhook_handler.stop_egress()
-await ctx.api.room.delete_room(...)
-```
-
-You can use any short snake_case reason string that fits your application.
-
-Common examples:
-
-- `conversation_complete`
-- `purpose_achieved`
-- `transfer_to_human`
-- `caller_hung_up`
-- `main_agent_hung_up`
-- `no_answer_timeout`
-- `silence_timeout`
-- `duration_limit`
-
-`set_call_end_reason()` is most useful when **your application logic** decides why
-the call is ending. For example:
-
-- an `end_call` tool is invoked by the agent
-- your app triggers a transfer to a human
-- you enforce a silence timeout or no-answer timeout
-- you intentionally delete the room during graceful shutdown
-
-## 🧪 Testing data (eval mode)
-
-When SuperBryn tests your agent, eval mode sends your agent's own record of each test call to SuperBryn, so you can see it next to the test: its transcript and tool calls, the latency of each reply (transcript, end of turn, first LLM token, first TTS audio, end to end), its models, turn-taking and interruption settings, tools, token and audio usage, every LLM request with what became of its answer (spoken, cut off, not spoken, stopped or only a tool call; not for models such as Nova Sonic that keep one request ID for the whole session), and every STT, LLM or TTS failure. It runs only for SuperBryn test calls, in the background: it adds no latency and records no audio. Every other call sends nothing about the call. To spot phone tests, a SIP call without a test ID checks SuperBryn's caller numbers; they are cached for an hour in a file in the temp dir that every job on the host shares (a failed fetch is retried after a minute).
-
-It needs livekit-evals 0.3.0 or later:
+## Setup
 
 ```bash
-pip install -U "livekit-evals>=0.3.0"
+export SUPERBRYN_API_KEY=sbryn_...                               # one key with test_data:write and obs:write
+export SUPERBRYN_AGENT_ID=3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b  # the agent's SuperBryn ID (not needed with an agent key)
 ```
 
-Add two lines to your entrypoint, once per job, before `session.start()`:
+Add one line to your entrypoint, once per job, **before** `session.start()`:
 
 ```python
-from livekit_evals import attach_test_data
+from livekit_evals import attach
 
 async def entrypoint(ctx: JobContext):
     session = AgentSession(...)
+    report = attach(ctx, session)
+    await session.start(agent=Assistant(), room=ctx.room)
+```
+
+That's all: `attach` registers its own shutdown hook.
+
+### Options
+
+| Option | Environment variable | What it does |
+|--------|----------------------|--------------|
+| `api_key` | `SUPERBRYN_API_KEY` | A SuperBryn API key: test calls need `test_data:write` and prompt versions `obs:write`; production calls take any valid key (the setup screens' keys hold both). Without one nothing is sent. |
+| `agent_id` | `SUPERBRYN_AGENT_ID` | The agent's SuperBryn ID, a UUID. Test calls need it unless the key is the agent's own key. Any other value is left out, with one warning. |
+| `production` | | `True` by default. `False` reports SuperBryn test calls only: production calls send nothing and are not recorded. |
+| `record` | | `True` by default. `False` reports production calls without SuperBryn's recording (for example for compliance). |
+| `custom_data` | | Your own keys for this call, a dict sent as given (see below). |
+| `prompt`, `prompt_version` | | The prompt template your agent runs, and your label for this version (see Prompt sync). |
+| `base_url` | `SUPERBRYN_BASE_URL` | The SuperBryn API origin, `https://api.superbryn.com` by default. |
+
+`WEBHOOK_URL`, `AGENT_ID`, `VERSION_ID`, `LIVEKIT_PROJECT_ID` and `SUPERBRYN_TEST_API_KEY`, which 0.3.x read, are not
+read any more.
+
+### The handle
+
+`attach` returns the call's handle. Use it for anything known only during the call, until the call ends:
+
+```python
+report.set_custom_data({"ticket_id": "TKT-9001"})          # replaces custom_data
+report.update_custom_data({"appointment_booked": True})    # merges into it; other keys are kept
+report.set_call_end_reason("transfer_to_human")            # sent as ended_reason instead of LiveKit's close reason
+report.set_recording_url("https://my-bucket/.../call.mp3")  # production calls: your own recording (see below)
+```
+
+### Custom data
+
+`custom_data` is sent at the top of `call.ended` exactly as you give it: the same key names and the same value types
+(a value JSON can't hold, such as a `datetime`, is sent as its text). SuperBryn's pre-ingestion filters and profiles
+match these key names, so keys like `enterprise_id` or `team_id` route production calls to the right source and
+profile. Set it in `attach(custom_data=...)` for what you know at the start, and with `set_custom_data()` or
+`update_custom_data()` for what you learn during the call.
+
+### Prompt sync
+
+Pass the prompt template your agent runs (placeholders unfilled) so SuperBryn knows exactly which prompt each call
+ran on:
+
+```python
+report = attach(ctx, session, prompt=PROMPT_TEMPLATE, prompt_version="v13")
+```
+
+Each call carries `context.prompt_ref = {"hash": "sha256:...", "version": "v13"}`, and the template's text is pushed
+to SuperBryn once per host, key and version (`POST /public-api/v1/prompts`, which needs `obs:write`; pushed again after
+a day, and a refused push is tried again after an hour). A prompt change
+you deploy shows up in the agent's settings in SuperBryn. Without `prompt=`, the first agent's instructions as
+rendered for the call are sent as `context.system_prompt` and matched as text.
+
+## How a SuperBryn test call is recognised
+
+- **Phone tests** need nothing more: they come from, or call, one of SuperBryn's numbers. The numbers are fetched
+  with your key (any valid SuperBryn API key) and cached for an hour in a file in the temp dir that
+  every job on the host shares; a refused key is asked again after an hour, an unanswered fetch after a minute.
+  A test call's data is stored only with `test_data:write`: with a Monitor-only key, SuperBryn's test calls are
+  recognised and kept out of Monitor.
+- **SIP endpoint tests** carry an `X-SuperBryn-Call-Id` header. Set your inbound trunk's `include_headers` to X headers
+  (`SIP_X_HEADERS`), or map `X-SuperBryn-Call-Id` with `headers_to_attributes` to an attribute named
+  `superbryn_call_id` (any name ending in `superbryn_call_id` or `x-superbryn-call-id` works).
+- **Webhook and Custom cURL triggers**: copy `superbryn_call_id` from SuperBryn's trigger request into the job
+  (dispatch) or room metadata as `{"superbryn_call_id": "..."}`.
+
+`attach` waits up to 15 seconds for the SIP participant to join; a caller in a browser (a standard participant) ends
+the wait at once. A call SuperBryn says is not one of its tests is not reported again as a production call.
+
+## Production calls
+
+**Recording.** Unless `record=False`, a production call is recorded in stereo to SuperBryn's storage as soon as it is recognised (an outbound phone
+call from its answer): one MP3,
+the agent on one channel and everyone else (the caller) on the other. No S3 settings are needed: short-lived upload
+credentials are fetched with your key. It needs LiveKit Egress (on by default on LiveKit Cloud) and the standard
+`LIVEKIT_URL`, `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET`; the egress is stopped when the job shuts down. A recording
+that can't start leaves the call unrecorded, never unreported. Test calls are never recorded by the package.
+
+**Your own recording.** If you run your own egress, pass its URL (public or pre-signed) with
+`report.set_recording_url(url)`. Set before the call is recognised (for example right after `attach`), SuperBryn's
+recording is not started; it is sent with `recording_url_source: "external"`.
+
+`observability` also carries `direction` (`inbound` when a SIP dispatch rule brought the call to your agent,
+`outbound` when your agent dialled).
+
+## What a report contains
+
+`POST {base_url}/public-api/v1/calls/agent-data`, with the key in `X-API-Key`. Every event repeats the call's identity:
+`schema_version`, `event_id` (`lk:<room SID>:started` or `:ended`, the same on a retry), `event`, `surface`,
+`source: "livekit"`, `call_id` (the room SID), `agent_id`, `from`, `to`, and `started_at`: when the caller joined, or for an
+outbound phone call when it was answered (dialling and ringing are not call time; `context.ring_started_at` keeps when
+it was dialled). Every `start_ms`, `end_ms` and `at_ms` counts from `started_at`. `call.ended` adds:
+
+| Field | What it holds |
+|-------|---------------|
+| `ended_at`, `ended_reason`, `ended_by` | When the session closed, why (LiveKit's close reason or yours; an outbound phone call that never connected says `user_unavailable`, `user_rejected`, `sip_trunk_failure` or `not_answered`), and who ended it: `agent`, `caller` or `system`. |
+| `transcript[]` | Each line: `id`, `role`, `text`, `start_ms`, `end_ms`; caller lines `confidence`; agent lines `interrupted` and `provider_request_id`. |
+| `tool_calls[]` | `id`, `name`, `arguments`, `result`, `is_error`, `start_ms`, `end_ms`, and `turn_id`, the agent line it fed. |
+| `diagnostics` | `pipeline`; `configuration` (STT, LLM and TTS with voice and language, turn detection, interruptions, tools); `turn_latencies[]` per reply (`transcriber_ms`, `endpointing_ms`, `model_ms`, `voice_ms`, `turn_ms`); `usage`; `llm_requests[]` with each one's outcome; `errors[]` with `source_model` and `source_provider`; `eou_events[]`; `dtmf[]`. |
+| `context` | `system_prompt` (the first agent's instructions as rendered), `prompt_ref`, `room_name`, `participant_identity`, `ring_started_at`, `environment` (package, livekit-agents, livekit-rtc and Python versions), and `close` when the session closed on an error. |
+| `custom_data` | Your keys, as given. |
+| `testing` | Test calls: `superbryn_call_id`, when the call carried one. |
+| `observability` | Production calls: `direction`, and `recording_url`, `stereo_recording_url`, `recording_url_source` on `call.ended`. |
+
+No audio is sent, and the package computes no averages: SuperBryn works them out from these records.
+
+## Logs
+
+Log lines (logger `livekit_evals`) start with `SUPERBRYN_CALL_REPORT_` (the recorder's own details go to
+`livekit_evals.recording_manager`): `SENT` when SuperBryn accepted an event (with
+any optional field it dropped), `DISABLED` without an API key, `WARNING` for an agent ID that isn't a UUID or caller
+numbers the key can't read, `RETRY`, `REJECTED` (with what to change) and `FAILED` for delivery problems, and `ERROR`
+for anything else. None of them affects the call.
+
+## Upgrading from 0.3.x
+
+0.4.0 replaces both 0.3.x entry points (the production webhook handler and `attach_test_data`) with `attach`. It posts
+a new body to a new endpoint, so pin the new version and change the setup in the same deploy.
+
+**Before (0.3.x):**
+
+```python
+from livekit_evals import attach_test_data, create_webhook_handler
+
+async def entrypoint(ctx: JobContext):
+    webhook_handler = create_webhook_handler(
+        room=ctx.room,
+        is_deployed_on_lk_cloud=True,
+        stereo_recording=True,
+        custom_data={"enterprise_id": "ent_42", "team_id": "t-7", "agent_type_id": "sales_inbound"},
+    )
+    session = AgentSession(...)
     attach_test_data(ctx, session)
-    await session.start(agent=YourAgent(), room=ctx.room)
+    await session.start(agent=Assistant(), room=ctx.room)
+    if webhook_handler:
+        await webhook_handler.attach_to_session(session)
+        ctx.add_shutdown_callback(webhook_handler.send_webhook)
+    ...
+    webhook_handler.update_custom_data({"lead_score": 82})
+    webhook_handler.set_call_end_reason("transfer_to_human")
 ```
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SUPERBRYN_TEST_API_KEY` | ✅ Yes | Organization API key with the `test_data:write` scope. Falls back to `SUPERBRYN_API_KEY` |
-| `SUPERBRYN_AGENT_ID` | ✅ Yes | Your SuperBryn agent ID (a UUID); without it nothing is sent. Leaves `AGENT_ID`, which Observability uses, untouched |
-| `SUPERBRYN_BASE_URL` | ⚪ Optional | Defaults to `https://api.superbryn.com` |
+**After (0.4.0):**
 
-`attach_test_data` also takes `api_key=`, `agent_id=` and `base_url=`.
-
-How a test call is recognised:
-- **Phone tests** need nothing more. They are matched by the number SuperBryn calls from.
-- **SIP endpoint tests** carry an `X-SuperBryn-Call-Id` header. Set your inbound trunk's `include_headers` to X headers (`SIP_X_HEADERS`), or map `X-SuperBryn-Call-Id` with `headers_to_attributes` to an attribute named `superbryn_call_id` (any name ending in `superbryn_call_id` or `x-superbryn-call-id` works; other names are not read).
-- **Webhook and Custom cURL triggers**: copy `superbryn_call_id` from SuperBryn's trigger request into the job (dispatch) or room metadata as `{"superbryn_call_id": "..."}`.
-
-Its info, warning and error log lines (logger `test_data`) start with `SUPERBRYN_TEST_DATA_`: `SUPERBRYN_TEST_DATA_SENT` when SuperBryn accepted an event, `SUPERBRYN_TEST_DATA_DISABLED` when the API key or agent ID is missing, `SUPERBRYN_TEST_DATA_RETRY`, `SUPERBRYN_TEST_DATA_REJECTED` and `SUPERBRYN_TEST_DATA_FAILED` for delivery problems, and `SUPERBRYN_TEST_DATA_ERROR` for anything else. None of them affects the call.
-
-## 🐛 Troubleshooting
-
-### Webhook Not Sending
-
-**Check API Key:**
-```bash
-echo $SUPERBRYN_API_KEY
-```
-
-**Enable Debug Logging:**
 ```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
+from livekit_evals import attach
+
+async def entrypoint(ctx: JobContext):
+    session = AgentSession(...)
+    report = attach(
+        ctx, session,
+        custom_data={"enterprise_id": "ent_42", "team_id": "t-7", "agent_type_id": "sales_inbound"},
+    )
+    await session.start(agent=Assistant(), room=ctx.room)
+    ...
+    report.update_custom_data({"lead_score": 82})
+    report.set_call_end_reason("transfer_to_human")
 ```
 
-**Look for these log messages:**
-- `SUPERBRYN_WEBHOOK_HANDLER_CREATED` - Handler initialized
-- `SUPERBRYN_WEBHOOK_SENT` - Webhook delivered successfully
-- `SUPERBRYN_WEBHOOK_UNAUTHORIZED` - Invalid API key
-- `SUPERBRYN_WEBHOOK_FAILED` - Delivery failed
-- `SUPERBRYN_WEBHOOK_ERROR` - Exception occurred
+Environment: `SUPERBRYN_API_KEY` is one key with both `test_data:write` and `obs:write` (it replaces
+`SUPERBRYN_TEST_API_KEY`); `SUPERBRYN_AGENT_ID` is the agent's SuperBryn ID, a UUID (a free-form `AGENT_ID` is not
+read; drop it when you use the agent's own key); remove `WEBHOOK_URL`.
 
-### Common Errors
+What else changed:
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `SUPERBRYN_API_KEY not configured` | Missing API key | Set `SUPERBRYN_API_KEY` environment variable |
-| `SUPERBRYN_WEBHOOK_UNAUTHORIZED` | Invalid API key | Verify your API key is correct |
-| `SUPERBRYN_WEBHOOK_FORBIDDEN` | Expired/disabled key | Generate a new API key |
-| `No empty turn found to fill` | State change timing issue | Usually harmless, check logs for patterns |
+- `create_webhook_handler`'s options are gone: production calls are recorded in stereo, and `disable_recording=True`
+  is `attach(..., record=False)` (`stereo_recording`, `defer_recording` and `stop_egress()` are not needed), and
+  `is_deployed_on_lk_cloud`, `livekit_project_id`, `call_rate_usd`, `extended_capture`, `first_message`,
+  `prompt_tools` and `sync_prompt` are not read. `set_external_recording_url(url)` is `report.set_recording_url(url)`.
+- The package no longer sends averages or counts (`speech_stats`, `latency`, turn-detection, interruption and VAD
+  summaries, network and WebRTC stats, SIP attributes); SuperBryn computes them from the raw records. Turn latency
+  keys are snake_case (`transcriber_ms`, `endpointing_ms`, `model_ms`, `voice_ms`, `turn_ms`).
+- After a handoff, `context.system_prompt` is still the first agent's prompt; lines no longer carry an `agent_id`.
 
-### Missing Transcript Data
+**A prompt for your coding agent** (copy and paste):
 
-Ensure `webhook_handler.attach_to_session(session)` is called:
-- ✅ **After** `await session.start()`
-- ✅ At the **end** of your entrypoint (no early returns)
+```text
+Upgrade this LiveKit agent from livekit-evals 0.3.x to livekit-evals 0.4.0 (pip: "livekit-evals>=0.4.0").
 
-### Provider Detection Issues
-
-The package auto-detects providers from model names. Supported providers (25+):
-
-**LLM Providers:**
-- OpenAI (gpt, whisper, tts-1, o1, o3)
-- Anthropic (claude)
-- Google (gemini, palm, bard, gemma)
-- Meta (llama, meta-llama)
-- Mistral (mistral, mixtral)
-- Cohere (cohere, command)
-- Perplexity (perplexity, pplx)
-- Groq
-- Together AI (together, togethercomputer)
-- Replicate
-- Hugging Face (huggingface, hf-)
-
-**TTS Providers:**
-- ElevenLabs (eleven, elevenlabs)
-- Cartesia (cartesia, sonic)
-- PlayHT (playht, play.ht)
-- Resemble AI (resemble, resembleai)
-- Murf (murf, murf.ai)
-- WellSaid Labs (wellsaid, wellsaidlabs)
-- Speechify
-- Sarvam (saarika, sarvam, bulbul)
-- Azure/Microsoft (azure, microsoft)
-- AWS Polly (aws, polly, amazon)
-- Google Cloud (gcloud, google-cloud)
-
-**STT Providers:**
-- Deepgram (deepgram, nova, aura)
-- AssemblyAI (assemblyai, assembly)
-- Rev.ai (rev.ai, revai)
-- Speechmatics
-- Gladia
-
-**Realtime/Multi-modal:**
-- LiveKit
-- Twilio
-- Vonage
-
-If your provider isn't detected, it will show as `"unknown"` but won't affect functionality.
-
-## 📝 Migration Guide
-
-If you're currently using the standalone `webhook_handler.py`:
-
-**Before:**
-```python
-from webhook_handler import create_webhook_handler
+1. Pin livekit-evals>=0.4.0 in the project's dependencies.
+2. In the agent's entrypoint, remove every use of the old API: create_webhook_handler(...),
+   webhook_handler.attach_to_session(session), ctx.add_shutdown_callback(webhook_handler.send_webhook),
+   webhook_handler.start_recording(), webhook_handler.stop_egress(), and attach_test_data(ctx, session).
+   Remove the matching imports.
+3. Add one call, `report = attach(ctx, session, ...)` (from livekit_evals import attach), right after the
+   AgentSession is created and BEFORE `await session.start(...)`. It registers its own shutdown hook.
+4. If create_webhook_handler was given custom_data, pass the same dict to attach(custom_data=...). Keep every
+   custom_data key name and every value type exactly as it is: SuperBryn's filters and profiles match on them.
+   If it was given prompt= or prompt_version=, pass them to attach the same way. If it was given
+   disable_recording=True, pass record=False to attach. Drop every other create_webhook_handler option
+   (is_deployed_on_lk_cloud, livekit_project_id, call_rate_usd, stereo_recording, defer_recording,
+   extended_capture, first_message, prompt_tools, sync_prompt).
+5. Replace webhook_handler.set_custom_data(...), webhook_handler.update_custom_data(...) and
+   webhook_handler.set_call_end_reason(...) with report.set_custom_data(...), report.update_custom_data(...) and
+   report.set_call_end_reason(...), with the same arguments. Replace
+   webhook_handler.set_external_recording_url(url) with report.set_recording_url(url). If the handler is passed to
+   other functions or tools, pass `report` instead. Remove any `if webhook_handler:` guards: attach always
+   returns a handle.
+6. Environment and deployment config: put SuperBryn's Agent data key (it holds both
+   test_data:write and obs:write) in SUPERBRYN_API_KEY and remove SUPERBRYN_TEST_API_KEY; replace a free-form AGENT_ID with SUPERBRYN_AGENT_ID set to the agent's
+   SuperBryn agent ID (a UUID), or remove it when the key is the agent's own key; remove WEBHOOK_URL, VERSION_ID
+   and LIVEKIT_PROJECT_ID if they were only used by livekit-evals.
+7. Do not change anything else in the agent. Show the diff when done.
 ```
 
-**After:**
-```python
-from livekit_evals import create_webhook_handler
-```
+## Links
 
-Everything else stays the same! The API is identical.
+- [LiveKit Agents documentation](https://docs.livekit.io/agents/)
+- [GitHub repository](https://github.com/superbryndev/livekit-evals)
+- [Issue tracker](https://github.com/superbryndev/livekit-evals/issues)
+- [Get an API key](https://app.superbryn.com/api-keys)
 
-## 🤝 Contributing
+## License
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+MIT, see [LICENSE](LICENSE).
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🔗 Links
-
-- [LiveKit Agents Documentation](https://docs.livekit.io/agents/)
-- [GitHub Repository](https://github.com/superbryndev/livekit-evals)
-- [Issue Tracker](https://github.com/superbryndev/livekit-evals/issues)
-- [Get API Key](https://app.superbryn.com/api-keys)
-
-## 💡 Support
-
-- 📧 Email: support@superbryn.com
-- 💬 GitHub Issues: [Report a bug](https://github.com/superbryndev/livekit-evals/issues)
-- 📚 Documentation: [README](https://github.com/superbryndev/livekit-evals#readme)
-
----
-
-Made with ❤️ by [SuperBryn](https://www.superbryn.com)
+Made by [SuperBryn](https://www.superbryn.com). Support: support@superbryn.com
