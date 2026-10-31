@@ -1,8 +1,8 @@
 """
 Basic LiveKit Agent with livekit-evals integration
 
-This example shows how to integrate livekit-evals into a simple voice AI agent.
-The integration requires just 3 lines of code to track all session metrics.
+This example shows how to integrate livekit-evals into a simple voice AI agent:
+one attach(ctx, session) call before session.start() reports every call to SuperBryn.
 """
 
 import logging
@@ -26,7 +26,7 @@ from livekit.plugins import cartesia, deepgram, noise_cancellation, openai, sile
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 # Import livekit-evals
-from livekit_evals import create_webhook_handler
+from livekit_evals import attach
 
 logger = logging.getLogger("agent")
 
@@ -70,23 +70,6 @@ async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
-
-    # ============================================================================
-    # LIVEKIT-EVALS INTEGRATION - STEP 1: Create webhook handler
-    # ============================================================================
-    # This will auto-detect agent_id, version_id, system_prompt, phone_number,
-    # SIP trunking, and egress recording from session and room context.
-    #
-    # Pass custom_data to attach any JSON-serializable fields to the webhook
-    # payload (available as payload["call"]["custom_data"]).  You can also
-    # call webhook_handler.update_custom_data({...}) at any point during the
-    # session to add fields discovered at runtime (e.g. after a tool call).
-    webhook_handler = create_webhook_handler(
-        room=ctx.room,
-        is_deployed_on_lk_cloud=True,  # Set to False if self-hosting
-        # Optional: attach arbitrary context to every webhook payload
-        # custom_data={"ticket_id": "TKT-9001", "customer_tier": "enterprise"},
-    )
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and LiveKit turn detector
     session = AgentSession(
@@ -142,6 +125,13 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
+    # ============================================================================
+    # LIVEKIT-EVALS: report this call to SuperBryn (before session.start())
+    # ============================================================================
+    # Needs SUPERBRYN_API_KEY (and SUPERBRYN_AGENT_ID for test calls). custom_data is optional; the returned
+    # handle takes values learned during the call: report.update_custom_data({...}).
+    report = attach(ctx, session, custom_data={"ticket_id": "TKT-9001", "customer_tier": "enterprise"})  # noqa: F841
+
     # Start the session, which initializes the voice pipeline and warms up models
     await session.start(
         agent=Assistant(),
@@ -153,15 +143,6 @@ async def entrypoint(ctx: JobContext):
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
-
-    # ============================================================================
-    # LIVEKIT-EVALS INTEGRATION - STEP 2 & 3: Attach to session and register callback
-    # ============================================================================
-    # IMPORTANT: This must be AFTER session.start() and BEFORE ctx.connect()
-    # This extracts the system prompt from session.agent and starts listening to events
-    if webhook_handler:
-        webhook_handler.attach_to_session(session)
-        ctx.add_shutdown_callback(webhook_handler.send_webhook)
 
     # Join the room and connect to the user
     await ctx.connect()

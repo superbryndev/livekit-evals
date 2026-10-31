@@ -1,4 +1,4 @@
-"""Tests for eval mode (livekit_evals.test_data) with fake job, room, session and HTTP; no network."""
+"""Tests for attach() (livekit_evals.call_report) with fake job, room, session, recorder and HTTP; no network."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -20,8 +21,8 @@ from livekit.agents.metrics import AgentSessionUsage, LLMModelUsage, STTModelUsa
 from livekit.agents.version import __version__ as LIVEKIT_AGENTS_VERSION
 from livekit.agents.voice.agent_activity import AgentActivity
 
-from livekit_evals import test_data
-from livekit_evals.test_data import attach_test_data
+from livekit_evals import call_report
+from livekit_evals.call_report import attach
 
 # Features only livekit-agents 1.8 has (expressive markup, the realtime fallback adapter).
 needs_livekit_1_8 = pytest.mark.skipif(
@@ -31,13 +32,15 @@ OUR_NUMBER = "+14155550100"
 THEIR_NUMBER = "+16505550199"
 AGENT_UUID = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
 BASE = "https://sb.test"
-AGENT_DATA_URL = BASE + "/public-api/v1/test-calls/agent-data"
-LINKED = (200, {"status": "linked", "is_test": True, "link": {"status": "verified", "method": "test_id"}})
+REPORT_URL = BASE + "/public-api/v1/calls/agent-data"
+LINKED = (200, {"surface": "testing", "status": "linked", "is_test": True,
+                 "link": {"status": "verified", "method": "test_id"}})
+STORED = (200, {"surface": "observability", "ok": True, "call_id": "obs_1"})
 T0 = 1_760_000_000.0
 
 
 class FakeHttp:
-    """Replaces test_data._http_request: records requests, plays scripted answers per endpoint."""
+    """Replaces call_report._http_request: records requests, plays scripted answers per endpoint."""
 
     def __init__(self) -> None:
         self.calls: list[SimpleNamespace] = []
@@ -45,13 +48,16 @@ class FakeHttp:
             "caller-numbers": [(200, {"numbers": [OUR_NUMBER, "+919876543210"]})],
             "started": [LINKED],
             "ended": [LINKED],
+            "obs_started": [(200, {"surface": "observability", "ok": True, "reason": "call_started_not_stored"})],
+            "obs_ended": [STORED],
         }
 
     async def __call__(self, method, url, headers, body):
         # as strict as the real transport: NaN or Infinity in a body fails the test
         self.calls.append(SimpleNamespace(method=method, url=url, headers=dict(headers),
                                           body=json.loads(json.dumps(body, allow_nan=False)) if body else None))
-        queue = self.script["caller-numbers" if url.endswith("/caller-numbers") else body["event"][5:]]
+        prefix = "obs_" if body and body.get("surface") == "observability" else ""
+        queue = self.script["caller-numbers" if url.endswith("/caller-numbers") else prefix + body["event"][5:]]
         answer = queue.pop(0) if len(queue) > 1 else queue[0]
         if answer == "hang":
             await asyncio.sleep(3600)
@@ -75,6 +81,18 @@ class FakeRoom:
         self.remote_participants = {p.identity: p for p in participants}
         self._sid = sid
         self._plain_sid = plain_sid
+        self.handlers = {}
+
+    def on(self, event, callback):
+        self.handlers.setdefault(event, []).append(callback)
+        return callback
+
+    def off(self, event, callback):
+        self.handlers.get(event, []).remove(callback)
+
+    def emit(self, event, *args):
+        for callback in list(self.handlers.get(event, [])):
+            callback(*args)
 
     @property
     def sid(self):
@@ -104,11 +122,18 @@ class FakeCtx:
                                for cb in self.shutdown_callbacks))
 
 
-def sip_participant(phone=OUR_NUMBER, trunk=THEIR_NUMBER, rule="SDR_inbound", **attributes):
-    """A SIP participant; a non-empty sip.ruleID means the call came in to their agent."""
+def sip_participant(phone=OUR_NUMBER, trunk=THEIR_NUMBER, rule="SDR_inbound", joined=T0, **attributes):
+    """A SIP participant that joined at `joined`; a non-empty sip.ruleID means the call came in to their agent."""
     attrs = {"sip.phoneNumber": phone, "sip.trunkPhoneNumber": trunk, "sip.ruleID": rule, **attributes}
     return SimpleNamespace(identity=f"sip_{phone}", kind=rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
-                           attributes=attrs)
+                           attributes=attrs, joined_at=datetime.fromtimestamp(joined, timezone.utc),
+                           disconnect_reason=None)
+
+
+def web_participant(identity="web-user", joined=T0):
+    """A caller in a browser (a standard participant)."""
+    return SimpleNamespace(identity=identity, kind=rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD, attributes={},
+                           joined_at=datetime.fromtimestamp(joined, timezone.utc), disconnect_reason=None)
 
 
 def session_with(*items):
@@ -203,16 +228,16 @@ def ctx_with_test_id():
 async def ended_body(http, session, reason="room disconnected"):
     """Run one test call through shutdown; the last call.ended body."""
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     await recognised(ctx)
     await ctx.shutdown(reason)
     return http.posts("call.ended")[-1].body
 
 
 async def recognised(ctx) -> bool:
-    """Wait for the background recognition (and call.started) to settle; True for a test call."""
-    call = ctx.shutdown_callbacks[0].__self__
-    return await asyncio.wait_for(asyncio.shield(call.task), 2)
+    """Wait for the background recognition (and call.started) to settle; True for a reported call."""
+    report = ctx.shutdown_callbacks[0].__self__
+    return await asyncio.wait_for(asyncio.shield(report._task), 2)
 
 
 async def until(condition, timeout=2.0):
@@ -226,24 +251,54 @@ async def until(condition, timeout=2.0):
 
 @pytest.fixture(autouse=True)
 def fast_and_clean(monkeypatch, tmp_path):
-    for name in ("SUPERBRYN_TEST_API_KEY", "SUPERBRYN_API_KEY", "SUPERBRYN_AGENT_ID", "AGENT_ID", "SUPERBRYN_BASE_URL"):
+    for name in ("SUPERBRYN_TEST_API_KEY", "SUPERBRYN_API_KEY", "SUPERBRYN_AGENT_ID", "AGENT_ID", "SUPERBRYN_BASE_URL",
+                 "WEBHOOK_URL"):
         monkeypatch.delenv(name, raising=False)
-    # The agent ID is required; tests about something else get it from the environment.
+    # Test calls need the agent; tests about something else get it from the environment.
     monkeypatch.setenv("SUPERBRYN_AGENT_ID", AGENT_UUID)
-    monkeypatch.setattr(test_data, "_no_agent_logged", False)
-    monkeypatch.setattr(test_data, "_SIP_WAIT_S", 0.2)
-    monkeypatch.setattr(test_data, "_POLL_S", 0.01)
-    monkeypatch.setattr(test_data, "_BACKOFF_S", (0.0, 0.0))
-    monkeypatch.setattr(test_data, "_no_key_logged", False)
+    monkeypatch.setattr(call_report, "_bad_agent_logged", False)
+    monkeypatch.setattr(call_report, "_numbers_refused_logged", False)
+    monkeypatch.setattr(call_report, "_SIP_WAIT_S", 0.2)
+    monkeypatch.setattr(call_report, "_POLL_S", 0.01)
+    monkeypatch.setattr(call_report, "_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(call_report, "_no_key_logged", False)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))  # the caller-number file of this test only
-    test_data._caller_numbers_cache.clear()
+    call_report._caller_numbers_cache.clear()
 
 
 @pytest.fixture
 def http(monkeypatch):
     fake = FakeHttp()
-    monkeypatch.setattr(test_data, "_http_request", fake)
+    monkeypatch.setattr(call_report, "_http_request", fake)
     return fake
+
+
+class FakeRecorder:
+    """RecordingManager stand-in: what it was asked, and a URL shaped like the real one."""
+
+    def __init__(self, credentials_url, api_key):
+        self.credentials_url, self.api_key = credentials_url, api_key
+        self.rooms, self.stopped = [], False
+
+    async def start_recording(self, room_name):
+        self.rooms.append(room_name)
+        return f"https://recordings.test/call_recordings/{room_name}/20251009-085320/call.mp3"
+
+    async def stop_recording(self):
+        self.stopped = True
+
+
+@pytest.fixture(autouse=True)
+def recorders(monkeypatch):
+    """Every recording a test started; none touches LiveKit or S3."""
+    made = []
+
+    def make(*args, **kwargs):
+        made.append(FakeRecorder(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(call_report, "RecordingManager", make)
+    return made
 
 
 # --- recognising a test call -------------------------------------------------
@@ -255,22 +310,20 @@ async def test_metadata_test_id_sends_call_started(http, where):
     # their agent dialled our number: no dispatch rule, so from = their trunk, to = us
     room = FakeRoom([sip_participant(rule="")], metadata=metadata if where == "room" else "")
     ctx = FakeCtx(room, job_metadata=metadata if where == "job" else "")
-    attach_test_data(ctx, session_with(), api_key="key_1", agent_id=AGENT_UUID, base_url=BASE + "/")
+    attach(ctx, session_with(), api_key="key_1", agent_id=AGENT_UUID, base_url=BASE + "/")
 
     assert await recognised(ctx) is True
     assert http.gets() == []  # a test ID needs no caller-number prefilter
     [started] = http.posts("call.started")
-    assert started.url == AGENT_DATA_URL
+    assert started.url == REPORT_URL
     assert started.headers == {"X-API-Key": "key_1", "Content-Type": "application/json"}
-    body = started.body
-    assert body["event_id"] == "lk:RM_job1:started"
-    assert body["call_id"] == "RM_job1"
-    assert body["source"] == "livekit"
-    assert body["schema_version"] == 1
-    assert body["superbryn_call_id"] == "sbc_meta"
-    assert body["agent_id"] == AGENT_UUID
-    assert (body["from"], body["to"]) == (THEIR_NUMBER, OUR_NUMBER)
-    assert body["started_at"].endswith("Z")
+    # identity only: the start fields and the testing block
+    assert started.body == {
+        "schema_version": 1, "event_id": "lk:RM_job1:started", "event": "call.started", "surface": "testing",
+        "source": "livekit", "call_id": "RM_job1", "agent_id": AGENT_UUID, "from": THEIR_NUMBER, "to": OUR_NUMBER,
+        "started_at": "2025-10-09T08:53:20.000Z",  # when the caller joined the room
+        "testing": {"superbryn_call_id": "sbc_meta"},
+    }
 
 
 @pytest.mark.parametrize("key", ["sip.h.x-superbryn-call-id", "sip.h.X-SuperBryn-Call-Id",
@@ -278,12 +331,12 @@ async def test_metadata_test_id_sends_call_started(http, where):
 async def test_sip_header_attribute_test_id(http, key):
     room = FakeRoom([sip_participant(**{key: " sbc_hdr "})])
     ctx = FakeCtx(room)
-    attach_test_data(ctx, session_with(), api_key="key_1", base_url=BASE)
+    attach(ctx, session_with(), api_key="key_1", base_url=BASE)
 
     assert await recognised(ctx) is True
     assert http.gets() == []
     [started] = http.posts("call.started")
-    assert started.body["superbryn_call_id"] == "sbc_hdr"
+    assert started.body["testing"] == {"superbryn_call_id": "sbc_hdr"}
     # we called their agent: from = us, to = their trunk number
     assert (started.body["from"], started.body["to"]) == (OUR_NUMBER, THEIR_NUMBER)
     assert started.body["agent_id"] == AGENT_UUID
@@ -292,7 +345,7 @@ async def test_sip_header_attribute_test_id(http, key):
 async def test_a_trunk_number_given_as_digits_only_is_sent_with_its_plus(http):
     room = FakeRoom([sip_participant(trunk=THEIR_NUMBER.lstrip("+"), superbryn_call_id="sbc_hdr")])
     ctx = FakeCtx(room)
-    attach_test_data(ctx, session_with(), api_key="key_1", base_url=BASE)
+    attach(ctx, session_with(), api_key="key_1", base_url=BASE)
 
     assert await recognised(ctx) is True
     [started] = http.posts("call.started")
@@ -301,14 +354,14 @@ async def test_a_trunk_number_given_as_digits_only_is_sent_with_its_plus(http):
 
 async def test_candidate_confirmed_by_server_sends_both_events(http):
     ctx = FakeCtx(FakeRoom([sip_participant(phone="+1 (415) 555-0100")]))  # formatting differs from ours
-    attach_test_data(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
+    attach(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
 
     assert await recognised(ctx) is True
     [get] = http.gets()
     assert get.url == BASE + "/public-api/v1/test-calls/caller-numbers"
     assert get.headers["X-API-Key"] == "k"
     [started] = http.posts("call.started")
-    assert "superbryn_call_id" not in started.body
+    assert started.body["surface"] == "testing" and "testing" not in started.body  # no test ID to send
 
     await ctx.shutdown()
     [ended] = http.posts("call.ended")
@@ -317,7 +370,7 @@ async def test_candidate_confirmed_by_server_sends_both_events(http):
 
     # the caller numbers are cached for the process
     ctx2 = FakeCtx(FakeRoom([sip_participant()], name="call-room-2"), job_room_name="call-room-2")
-    attach_test_data(ctx2, session_with(), api_key="k", base_url=BASE)
+    attach(ctx2, session_with(), api_key="k", base_url=BASE)
     assert await recognised(ctx2) is True
     assert len(http.gets()) == 1
 
@@ -325,7 +378,7 @@ async def test_candidate_confirmed_by_server_sends_both_events(http):
 async def test_candidate_denied_by_server_stops(http):
     http.script["started"] = [(200, {"status": "ignored", "is_test": False, "reason": "not_a_test"})]
     ctx = FakeCtx(FakeRoom([sip_participant(phone="4155550100")]))  # last-10-digit match
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
 
     assert await recognised(ctx) is False
     await ctx.shutdown()
@@ -333,23 +386,35 @@ async def test_candidate_denied_by_server_stops(http):
     assert http.posts("call.ended") == []
 
 
-@pytest.mark.parametrize("participants", [[sip_participant(phone="+12125550123")], []],
-                         ids=["other-caller", "no-sip-participant"])
-async def test_non_candidate_sends_nothing(http, participants):
+@pytest.mark.parametrize("participants", [[sip_participant(phone="+12125550123")], [web_participant()], []],
+                         ids=["other-caller", "web-caller", "no-caller"])
+async def test_production_false_sends_nothing_for_a_call_that_is_not_a_test(http, recorders, participants):
     ctx = FakeCtx(FakeRoom(participants))
-    attach_test_data(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
+    attach(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE, production=False)
 
     assert await recognised(ctx) is False
     await ctx.shutdown()
     assert [c for c in http.calls if c.method == "POST"] == []
-    assert len(http.gets()) == (1 if participants else 0)
+    assert len(http.gets()) == (1 if participants and participants[0].kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                                else 0)
+    assert recorders == []
+
+
+async def test_production_false_still_reports_a_test_call(http, recorders):
+    ctx = ctx_with_test_id()
+    attach(ctx, session_with(), api_key="k", base_url=BASE, production=False)
+
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+    assert [c.body["surface"] for c in http.calls] == ["testing", "testing"]
+    assert recorders == []  # test calls are never recorded by the package
 
 
 @pytest.mark.parametrize("plain_sid", [False, True], ids=["awaitable-sid", "plain-sid"])
 async def test_room_sid_when_job_has_none(http, plain_sid):
     room = FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"}), plain_sid=plain_sid)
     ctx = FakeCtx(room, job_room_sid="")
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
 
     await recognised(ctx)
     [started] = http.posts("call.started")
@@ -357,7 +422,7 @@ async def test_room_sid_when_job_has_none(http, plain_sid):
 
 
 def numbers_file(tmp_path):
-    return tmp_path / os.path.basename(test_data._numbers_file(BASE))
+    return tmp_path / os.path.basename(call_report._numbers_file(BASE, "k"))
 
 
 def age_numbers_file(tmp_path, seconds):
@@ -366,77 +431,92 @@ def age_numbers_file(tmp_path, seconds):
 
 
 async def test_caller_numbers_are_shared_with_later_jobs_on_the_host(http, tmp_path):
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
     assert json.loads(numbers_file(tmp_path).read_text())["numbers"] == [OUR_NUMBER, "+919876543210"]
-    test_data._caller_numbers_cache.clear()  # LiveKit runs the next job in a new process
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    call_report._caller_numbers_cache.clear()  # LiveKit runs the next job in a new process
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
     assert len(http.gets()) == 1
 
     age_numbers_file(tmp_path, 3600)  # an hour old: fetched again
-    test_data._caller_numbers_cache.clear()
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    call_report._caller_numbers_cache.clear()
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
     assert len(http.gets()) == 2
-    assert test_data._numbers_file("https://other.test") != test_data._numbers_file(BASE)
+    assert call_report._numbers_file("https://other.test", "k") != call_report._numbers_file(BASE, "k")
+    assert call_report._numbers_file(BASE, "another agent's key") != call_report._numbers_file(BASE, "k")
 
 
-async def test_a_failed_caller_number_lookup_is_retried_after_a_minute_by_any_job(http, tmp_path):
-    http.script["caller-numbers"] = [(401, {"error": "invalid_api_key"}), (200, {"numbers": [OUR_NUMBER]})]
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is False
-    test_data._caller_numbers_cache.clear()
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is False
+async def test_a_refused_key_is_asked_again_by_any_job_only_after_an_hour(http, tmp_path):
+    http.script["caller-numbers"] = [(403, {"error": "insufficient_scope"}), (200, {"numbers": [OUR_NUMBER]})]
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is False
+    age_numbers_file(tmp_path, 60)
+    call_report._caller_numbers_cache.clear()
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is False  # a minute on: still refused
     assert len(http.gets()) == 1
 
-    age_numbers_file(tmp_path, 60)
-    test_data._caller_numbers_cache.clear()
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    age_numbers_file(tmp_path, 3540)
+    call_report._caller_numbers_cache.clear()
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
     assert len(http.gets()) == 2
+
+
+async def test_an_unanswered_caller_number_lookup_is_retried_by_any_job_after_a_minute(http, tmp_path):
+    http.script["caller-numbers"] = [ConnectionError("down")] * 3 + [(200, {"numbers": [OUR_NUMBER]})]
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is False
+    asked = len(http.gets())
+    call_report._caller_numbers_cache.clear()
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is False
+    assert len(http.gets()) == asked
+
+    age_numbers_file(tmp_path, 60)
+    call_report._caller_numbers_cache.clear()
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
 
 
 async def test_the_caller_number_file_never_breaks_the_lookup(http, monkeypatch, tmp_path):
     numbers_file(tmp_path).write_text("{not json")  # unreadable: fetched again and replaced
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
     assert json.loads(numbers_file(tmp_path).read_text())["numbers"] == [OUR_NUMBER, "+919876543210"]
     assert [p.name for p in tmp_path.iterdir()] == [numbers_file(tmp_path).name]  # no temp file left behind
 
     elsewhere = tmp_path / "elsewhere.json"  # a link (or a pipe or device, which could block) is never opened
     numbers_file(tmp_path).rename(elsewhere)
     numbers_file(tmp_path).symlink_to(elsewhere)
-    assert test_data._read_numbers_file(BASE) is None
+    assert call_report._read_numbers_file(BASE, "k") is None
 
     def no_temp_dir():
         raise FileNotFoundError("No usable temporary directory")
 
     monkeypatch.setattr(tempfile, "gettempdir", no_temp_dir)  # nowhere to keep it: memory only
-    test_data._caller_numbers_cache.clear()
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
-    assert await test_data._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    call_report._caller_numbers_cache.clear()
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
+    assert await call_report._is_caller_number(OUR_NUMBER, BASE, "k") is True
     assert len(http.gets()) == 2
 
 
 async def test_a_test_id_over_200_characters_is_ignored(http, caplog):
     metadata = json.dumps({"superbryn_call_id": "sbc_" + "y" * 250})
     ctx = FakeCtx(FakeRoom([sip_participant()]), job_metadata=metadata)
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
 
     assert await recognised(ctx) is True  # the caller number still matches
     [started] = http.posts("call.started")
-    assert "superbryn_call_id" not in started.body
+    assert "testing" not in started.body
     assert len(http.gets()) == 1
     assert caplog.text.count("superbryn_call_id over 200 characters ignored") == 1
 
     header = {"sip.h.x-superbryn-call-id": "sbc_hdr"}  # a valid test ID elsewhere is used instead
     ctx2 = FakeCtx(FakeRoom([sip_participant(**header)], name="call-room-2"), job_metadata=metadata,
                    job_room_name="call-room-2", job_room_sid="RM_job2")
-    attach_test_data(ctx2, session_with(), api_key="k", base_url=BASE)
+    attach(ctx2, session_with(), api_key="k", base_url=BASE)
     assert await recognised(ctx2) is True
-    assert http.posts("call.started")[1].body["superbryn_call_id"] == "sbc_hdr"
+    assert http.posts("call.started")[1].body["testing"] == {"superbryn_call_id": "sbc_hdr"}
 
 
 async def test_from_and_to_are_cut_to_200_characters(http):
     room = FakeRoom([sip_participant(phone="sip:" + "1" * 300, trunk="2" * 250)],
                     metadata=json.dumps({"superbryn_call_id": "sbc_1"}))
     ctx = FakeCtx(room)
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
     await recognised(ctx)
     await ctx.shutdown()
 
@@ -466,7 +546,7 @@ async def test_transcript_and_tool_call_mapping(http):
         ChatMessage(id="item_shipped", role="assistant", content=["It has shipped."], created_at=t0 + 9.0),
     )
     ctx = FakeCtx(FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"})))
-    attach_test_data(ctx, session, api_key="k", agent_id=AGENT_UUID, base_url=BASE)
+    attach(ctx, session, api_key="k", agent_id=AGENT_UUID, base_url=BASE)
     await recognised(ctx)
     await ctx.shutdown()
 
@@ -475,7 +555,7 @@ async def test_transcript_and_tool_call_mapping(http):
     body = ended.body
     assert body["event_id"] == "lk:RM_job1:ended"
     assert body["ended_at"].endswith("Z")
-    for field in ("call_id", "source", "schema_version", "superbryn_call_id", "agent_id", "from", "to",
+    for field in ("call_id", "surface", "source", "schema_version", "testing", "agent_id", "from", "to",
                   "started_at"):
         assert body[field] == started.body[field]
     assert body["transcript"] == [
@@ -553,7 +633,7 @@ async def strict_server():
         return web.json_response(LINKED[1])
 
     app = web.Application()
-    app.router.add_post("/public-api/v1/test-calls/agent-data", agent_data)
+    app.router.add_post("/public-api/v1/calls/agent-data", agent_data)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
@@ -569,7 +649,7 @@ async def test_the_real_transport_sends_strict_json(strict_server):
         FunctionCall(call_id="call_1", name="calc", arguments='{"amount": 1e999, "ratio": NaN}', created_at=T0 + 1),
     )
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=base)
+    attach(ctx, session, api_key="k", base_url=base)
     assert await recognised(ctx) is True
     await ctx.shutdown()
 
@@ -584,7 +664,7 @@ async def test_text_is_cut_in_utf16_units_like_the_server(http):
     session = session_with(ChatMessage(role="user", content=[emoji_text]),
                            ChatMessage(role="assistant", content=[ascii_text]))
     ctx = FakeCtx(FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"})))
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     await recognised(ctx)
     await ctx.shutdown()
 
@@ -630,11 +710,11 @@ async def test_turn_latencies_pair_each_reply_with_the_user_turn_before_it(http)
     diagnostics = (await ended_body(http, session))["diagnostics"]
 
     assert diagnostics["turn_latencies"] == [
-        {"turn_id": "item_greet", "voiceLatency": 200},  # answers no user message
+        {"turn_id": "item_greet", "voice_ms": 200},  # answers no user message
         # the last user message counts; endpointing leaves out the transcript wait (206.4 - 104.4 ms)
-        {"turn_id": "item_a1", "transcriberLatency": 104, "endpointingLatency": 102, "modelLatency": 728,
-         "voiceLatency": 164, "turnLatency": 1103},
-        {"transcriberLatency": 300, "endpointingLatency": 0, "modelLatency": 500},  # no text, so no turn_id
+        {"turn_id": "item_a1", "transcriber_ms": 104, "endpointing_ms": 102, "model_ms": 728,
+         "voice_ms": 164, "turn_ms": 1103},
+        {"transcriber_ms": 300, "endpointing_ms": 0, "model_ms": 500},  # no text, so no turn_id
     ]
 
 
@@ -775,34 +855,34 @@ async def test_the_llm_is_named_by_the_model_most_tokens_went_to(http, tokens, e
 
 async def test_live_turn_detection_is_what_livekit_resolved():  # real AgentSession + AgentActivity, not started
     realtime = AgentSession(llm=Realtime(), vad=None)  # no turn detection given, as realtime agents usually do
-    assert test_data._live_turn_detection(AgentActivity(Agent(instructions="x"), realtime)) == {
+    assert call_report._live_turn_detection(AgentActivity(Agent(instructions="x"), realtime)) == {
         "type": "realtime_llm"}
 
     stt = SimpleNamespace(capabilities=SimpleNamespace(streaming=True, aligned_transcript=False))
     session = AgentSession(stt=stt, vad=None,
                            turn_handling={"turn_detection": "stt", "endpointing": {"min_delay": 0.4}})
     # LiveKit drafts replies early unless told not to
-    assert test_data._live_turn_detection(AgentActivity(Agent(instructions="x"), session)) == {
+    assert call_report._live_turn_detection(AgentActivity(Agent(instructions="x"), session)) == {
         "type": "stt", "min_end_of_turn_ms": 400, "max_end_of_turn_ms": 3000, "preemptive_generation": True}
     agent = Agent(instructions="x", turn_handling={"turn_detection": "manual", "preemptive_generation": {"enabled": False},
                                                    "endpointing": {"min_delay": 1.2, "max_delay": 4.0}})
-    assert test_data._live_turn_detection(AgentActivity(agent, session)) == {
+    assert call_report._live_turn_detection(AgentActivity(agent, session)) == {
         "type": "manual", "min_end_of_turn_ms": 1200, "max_end_of_turn_ms": 4000, "preemptive_generation": False}
 
-    assert test_data._live_turn_detection(None) is None
-    assert test_data._live_turn_detection(SimpleNamespace(_turn_detection="vad")) is None  # another SDK shape
+    assert call_report._live_turn_detection(None) is None
+    assert call_report._live_turn_detection(SimpleNamespace(_turn_detection="vad")) is None  # another SDK shape
 
 
 async def test_live_turn_detection_before_1_8():  # an AgentActivity without _rt_turn_detection_enabled
     # A turn detector the SDK dropped (no VAD) is reported as none, with the delays that still apply.
     older = SimpleNamespace(_turn_detection=None, min_endpointing_delay=0.3, max_endpointing_delay=2.5, llm=None)
-    assert test_data._live_turn_detection(older) == {"min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
+    assert call_report._live_turn_detection(older) == {"min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
     older._turn_detection = "vad"
-    assert test_data._live_turn_detection(older) == {"type": "vad", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
+    assert call_report._live_turn_detection(older) == {"type": "vad", "min_end_of_turn_ms": 300, "max_end_of_turn_ms": 2500}
     older._session = SimpleNamespace(options=SimpleNamespace(preemptive_generation=False))  # a bool on the session
-    assert test_data._live_turn_detection(older)["preemptive_generation"] is False
+    assert call_report._live_turn_detection(older)["preemptive_generation"] is False
     older.llm = Realtime()  # server-side turn detection takes the turns
-    assert test_data._live_turn_detection(older) == {"type": "realtime_llm"}
+    assert call_report._live_turn_detection(older) == {"type": "realtime_llm"}
 
 
 async def test_turn_detection_seen_during_the_call_wins_over_the_options(http):
@@ -810,7 +890,7 @@ async def test_turn_detection_seen_during_the_call_wins_over_the_options(http):
                                              "endpointing": {"min_delay": 0.3, "max_delay": 2.5}})
     session = FakeSession(options=options)
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     assert await recognised(ctx) is True
 
     session._activity = SimpleNamespace(_rt_turn_detection_enabled=True)  # the realtime model takes turns
@@ -852,15 +932,16 @@ async def test_each_llm_request_gets_what_became_of_its_answer(http):
     ]
     body = await ended_body(http, session)
 
+    # one clock for the transcript and the requests: ms from when the caller joined (T0)
     assert body["diagnostics"]["llm_requests"] == [
-        {"start_ms": 500, "outcome": "tool_call", "input_tokens": 900, "cached_input_tokens": 600, "output_tokens": 20},
-        {"start_ms": 1500, "outcome": "spoken", "input_tokens": 950, "cached_input_tokens": 0, "output_tokens": 12},
-        {"start_ms": 3500, "outcome": "not_spoken"},
-        {"start_ms": 4100, "outcome": "cut_off", "input_tokens": 980, "cached_input_tokens": 0, "output_tokens": 30},
-        {"start_ms": 5500, "outcome": "stopped"},
+        {"start_ms": 1000, "outcome": "tool_call", "input_tokens": 900, "cached_input_tokens": 600,
+         "output_tokens": 20},
+        {"start_ms": 2000, "outcome": "spoken", "input_tokens": 950, "cached_input_tokens": 0, "output_tokens": 12},
+        {"start_ms": 4000, "outcome": "not_spoken"},
+        {"start_ms": 4600, "outcome": "cut_off", "input_tokens": 980, "cached_input_tokens": 0, "output_tokens": 30},
+        {"start_ms": 6000, "outcome": "stopped"},
     ]
-    # one clock for the transcript and the requests
-    assert [turn["start_ms"] for turn in body["transcript"]] == [0, 2000, 4700]
+    assert [turn["start_ms"] for turn in body["transcript"]] == [500, 2500, 5200]
 
 
 async def test_a_request_the_llm_failed_on_is_stopped_whatever_its_first_token_time(http):
@@ -892,8 +973,8 @@ async def test_realtime_responses_own_the_replies_that_start_after_them(http):
     body = await ended_body(http, session)
 
     assert body["diagnostics"]["llm_requests"] == [
-        {"start_ms": 0, "outcome": "spoken", "input_tokens": 500, "cached_input_tokens": 0, "output_tokens": 40},
-        {"start_ms": 2600, "outcome": "cut_off", "input_tokens": 700, "cached_input_tokens": 300, "output_tokens": 55},
+        {"start_ms": 300, "outcome": "spoken", "input_tokens": 500, "cached_input_tokens": 0, "output_tokens": 40},
+        {"start_ms": 2900, "outcome": "cut_off", "input_tokens": 700, "cached_input_tokens": 300, "output_tokens": 55},
     ]
 
 
@@ -942,8 +1023,8 @@ async def test_realtime_reply_waits_run_from_the_caller_stopping(http):
 
     # the greeting answers no caller speech, and a second reply in the same turn none either
     assert body["diagnostics"]["turn_latencies"] == [
-        {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
-        {"turn_id": "item_a3", "turnLatency": 600},
+        {"turn_id": "item_a1", "model_ms": 700, "turn_ms": 800},
+        {"turn_id": "item_a3", "turn_ms": 600},
     ]
     # a caller line ends when the caller stopped; LiveKit's stand-in confidence of 1.0 is left out
     assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
@@ -971,7 +1052,7 @@ async def test_a_realtime_caller_line_stamped_after_the_caller_stopped_moves_bac
     assert [turn for turn in body["transcript"] if turn["role"] == "user"] == [
         {"id": "item_u1", "role": "user", "text": "Where is my order?", "start_ms": 1000, "end_ms": 2000},
     ]
-    assert body["diagnostics"]["turn_latencies"] == [{"turn_id": "item_a1", "modelLatency": 650, "turnLatency": 800}]
+    assert body["diagnostics"]["turn_latencies"] == [{"turn_id": "item_a1", "model_ms": 650, "turn_ms": 800}]
 
 
 def nova_session(**attributes):
@@ -991,7 +1072,7 @@ def nova_session(**attributes):
 
 async def test_nova_sonic_replies_get_no_wait_and_its_caller_lines_no_times_without_a_vad(http, monkeypatch):
     # its "caller stopped" is when its own reply started: a wait from it would be the playback delay alone
-    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
     body = await ended_body(http, nova_session())
 
     assert "turn_latencies" not in body["diagnostics"]
@@ -1000,16 +1081,16 @@ async def test_nova_sonic_replies_get_no_wait_and_its_caller_lines_no_times_with
 
 async def test_a_realtime_reply_with_a_vad_gets_its_wait_without_the_models_part(http, monkeypatch):
     # with a VAD on the session the caller's stops are real: the reply pairs with the last one before it was heard
-    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
     diagnostics = (await ended_body(http, nova_session(vad=object())))["diagnostics"]
 
-    assert diagnostics["turn_latencies"] == [{"turn_id": "item_a1", "turnLatency": 200}]
+    assert diagnostics["turn_latencies"] == [{"turn_id": "item_a1", "turn_ms": 200}]
 
 
 async def test_livekits_default_vad_does_not_make_nova_caller_times_real(http, monkeypatch):
     # LiveKit 1.8 gives every session a VAD when none is passed; realtime models never run it, so the stand-in stops
     # stay stand-ins (staging Nova calls sent ~115 ms waits and placeholder caller times on 0.3.1)
-    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
     body = await ended_body(http, nova_session(vad=object(), _using_default_vad=True))
 
     assert "turn_latencies" not in body["diagnostics"]
@@ -1018,17 +1099,17 @@ async def test_livekits_default_vad_does_not_make_nova_caller_times_real(http, m
 
 async def test_a_real_sessions_default_vad_is_not_a_given_one():  # real AgentSession, not started
     nova = Realtime("amazon.nova-2-5-sonic", "Amazon")
-    assert test_data._caller_times_real(AgentSession(llm=nova)) is False
-    assert test_data._caller_times_real(AgentSession(llm=nova, vad=object())) is True
-    assert test_data._caller_times_real(AgentSession(llm=Realtime())) is True  # OpenAI's own stops are real
+    assert call_report._caller_times_real(AgentSession(llm=nova)) is False
+    assert call_report._caller_times_real(AgentSession(llm=nova, vad=object())) is True
+    assert call_report._caller_times_real(AgentSession(llm=Realtime())) is True  # OpenAI's own stops are real
 
 
 def test_the_agents_own_vad_wins_over_the_sessions():
     session = lambda agent, **kw: FakeSession(agent=agent, **kw)  # noqa: E731
-    assert test_data._given_vad(session(SimpleNamespace(vad=object()), vad=object(), _using_default_vad=True))
-    assert not test_data._given_vad(session(SimpleNamespace(vad=None), vad=object(), _using_default_vad=False))
-    assert test_data._given_vad(session(None, vad=object(), _using_default_vad=False))
-    assert not test_data._given_vad(session(None, vad=None))
+    assert call_report._given_vad(session(SimpleNamespace(vad=object()), vad=object(), _using_default_vad=True))
+    assert not call_report._given_vad(session(SimpleNamespace(vad=None), vad=object(), _using_default_vad=False))
+    assert call_report._given_vad(session(None, vad=object(), _using_default_vad=False))
+    assert not call_report._given_vad(session(None, vad=None))
 
 
 async def test_gemini_live_replies_found_by_id_still_get_no_wait_its_caller_stops_are_stand_ins(http):
@@ -1077,8 +1158,8 @@ async def test_a_realtime_reply_found_by_id_pairs_with_the_stop_before_its_respo
     diagnostics = (await ended_body(http, session))["diagnostics"]
 
     assert diagnostics["turn_latencies"] == [
-        {"turn_id": "item_a1", "modelLatency": 700, "turnLatency": 800},
-        {"turn_id": "item_a2", "modelLatency": 1400, "turnLatency": 1500},
+        {"turn_id": "item_a1", "model_ms": 700, "turn_ms": 800},
+        {"turn_id": "item_a2", "model_ms": 1400, "turn_ms": 1500},
     ]
 
 
@@ -1162,7 +1243,7 @@ NOVA_PIECES = [
 async def test_nova_sonic_usage_pieces_are_no_requests_but_their_tokens_count(http, monkeypatch):
     # its pieces are stamped as each reply's audio arrives (staging calls: within ~40 ms of the reply starting to
     # play), so no request's start or outcome can be told; usage keeps the session's tokens and their split
-    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
     usage = AgentSessionUsage(model_usage=[LLMModelUsage(
         provider="Amazon", model="amazon.nova-2-5-sonic", input_tokens=869, input_audio_tokens=465,
         input_text_tokens=404, output_tokens=307, output_audio_tokens=196, output_text_tokens=111)])
@@ -1209,11 +1290,37 @@ async def test_no_recorded_requests_sends_no_llm_requests(http):
     assert "llm_requests" not in (body.get("diagnostics") or {})
 
 
-def error_event(kind, at, message, recoverable, label):
-    """A recorded ErrorEvent, as the session emits one for a failing STT, LLM or TTS."""
+def error_event(kind, at, message, recoverable, label, source=None):
+    """A recorded ErrorEvent, as the session emits one for a failing STT, LLM or TTS (source: the model that failed)."""
     error = SimpleNamespace(type=kind, timestamp=T0 + at, label=label, error=RuntimeError(message),
                             recoverable=recoverable)
-    return SimpleNamespace(type="error", created_at=T0 + at, error=error)
+    return SimpleNamespace(type="error", created_at=T0 + at, error=error, source=source)
+
+
+def plugin(module, **attributes):
+    """A component whose class lives in a provider plugin's module, as livekit.plugins.<vendor> ones do."""
+    return type("Plugin", (), {"__module__": module, **attributes})()
+
+
+async def test_errors_name_the_model_that_failed_and_its_vendor(http):
+    session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0))
+    session._recorded_events = [
+        # LiveKit Inference names the vendor in the model; its own provider is "livekit"
+        error_event("llm_error", 2.0, "timed out", True, "inference.LLM",
+                    SimpleNamespace(model="openai/gpt-4.1-mini", provider="livekit")),
+        error_event("stt_error", 3.0, "closed", True, "deepgram.STT", plugin("livekit.plugins.deepgram.stt",
+                                                                              model="nova-3")),
+        error_event("llm_error", 4.0, "closed", True, "xai.Realtime", plugin("livekit.plugins.xai.realtime",
+                                                                              model="grok-voice-3.0")),
+        error_event("llm_error", 5.0, "closed", True, "aws.Realtime", plugin("livekit.plugins.aws.realtime",
+                                                                              model="amazon.nova-2-5-sonic")),
+        error_event("tts_error", 6.0, "closed", False, "custom.TTS", SimpleNamespace(model="unknown")),
+    ]
+    errors = (await ended_body(http, session))["diagnostics"]["errors"]
+
+    assert [(e.get("source_model"), e.get("source_provider")) for e in errors] == [
+        ("openai/gpt-4.1-mini", "openai"), ("nova-3", "deepgram"), ("grok-voice-3.0", "xai"),
+        ("amazon.nova-2-5-sonic", "aws"), (None, None)]
 
 
 async def test_pipeline_failures_are_sent_as_errors(http):
@@ -1268,14 +1375,14 @@ async def test_a_retried_failure_recovered_when_its_step_worked_again_before_fai
 async def test_live_interruptions_are_what_livekit_resolved():  # real AgentSession + AgentActivity, not started
     stt = SimpleNamespace(capabilities=SimpleNamespace(streaming=True, aligned_transcript=False))
     session = AgentSession(stt=stt, vad=None, turn_handling={"turn_detection": "stt"})
-    assert test_data._live_interruptions(AgentActivity(Agent(instructions="x"), session)) == {
+    assert call_report._live_interruptions(AgentActivity(Agent(instructions="x"), session)) == {
         "enabled": True, "min_duration_ms": 500, "min_words": 0}
     off = Agent(instructions="x", allow_interruptions=False)  # the agent's own setting wins over the session's
-    assert test_data._live_interruptions(AgentActivity(off, session))["enabled"] is False
+    assert call_report._live_interruptions(AgentActivity(off, session))["enabled"] is False
     own = Agent(instructions="x", turn_handling={"interruption": {"min_duration": 1.2, "min_words": 2}})
-    assert test_data._live_interruptions(AgentActivity(own, session)) == {
+    assert call_report._live_interruptions(AgentActivity(own, session)) == {
         "enabled": True, "min_duration_ms": 1200, "min_words": 2}
-    assert test_data._live_interruptions(None) is None
+    assert call_report._live_interruptions(None) is None
 
 
 async def test_livekit_inference_stt_stand_in_confidence_is_left_out(http):
@@ -1292,7 +1399,7 @@ async def test_livekit_inference_stt_stand_in_confidence_is_left_out(http):
 
 async def test_a_nova_sonic_failure_on_the_monotonic_clock_keeps_its_time(http, monkeypatch):
     # Nova Sonic stamps its errors on the monotonic clock: 3 s here is T0 + 3, as the clocks read T0 + 100 and 100
-    monkeypatch.setattr(test_data, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: T0 + 100.0, monotonic=lambda: 100.0))
     session = FakeSession(chat("user", "Hi", 0.0), chat("assistant", "Hello", 1.0), llm=Realtime())
     error = SimpleNamespace(type="realtime_model_error", timestamp=3.0, label="aws.realtime.RealtimeModel",
                             error=RuntimeError("stream closed"), recoverable=True)
@@ -1315,7 +1422,7 @@ async def test_tools_of_every_active_agent_are_sent_once(http):
     third = SimpleNamespace(tools=[tool("hang_up", "Hang up.")])
     session = FakeSession(agent=first, tools=[tool("end_call", "End the call.")])
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     assert await recognised(ctx) is True  # call.started saw the first agent
 
     # every conversation item and agent state change samples the agent running then
@@ -1345,7 +1452,7 @@ async def test_mcp_tools_of_the_running_agent_are_sent(http):
     # AgentActivity alone, and empties both when the session closes, before the job's shutdown
     session = FakeSession(agent=SimpleNamespace(tools=[llm.Toolset(id="mcp_toolset_1", tools=[])]))
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     assert await recognised(ctx) is True  # nothing set up yet
 
     mcp_server_tools = llm.Toolset(id="mcp_toolset_2", tools=[raw_tool("search_kb", "Search the help centre.")])
@@ -1362,7 +1469,7 @@ async def test_mcp_tools_of_the_running_agent_are_sent(http):
 async def test_a_failing_sample_warns_once_and_never_reaches_the_agent(http, caplog):
     session = FakeSession(agent=SimpleNamespace(tools=[tool("end_call", "End the call.")]))
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     assert await recognised(ctx) is True
     session._activity = SimpleNamespace(tools=17)  # a TypeError here: LiveKit's emitter re-raises those
     for _ in range(3):
@@ -1398,7 +1505,7 @@ async def test_usage_totals(http, entries, expected):
 async def test_ended_reason_from_the_close_event(http):
     session = FakeSession()
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     await recognised(ctx)
     session.emit("close", CloseEvent(reason=CloseReason.USER_INITIATED))
     await ctx.shutdown("room disconnected")
@@ -1450,8 +1557,8 @@ async def test_a_failing_section_is_left_out_alone(http, caplog):
     assert body["diagnostics"] == {
         "pipeline": "stt_llm_tts",
         "configuration": {"llm": {"provider": "openai", "model": "gpt-4.1"}, "interruptions": {"enabled": True}},
-        "turn_latencies": [{"turn_id": "item_a1", "transcriberLatency": 100, "endpointingLatency": 200,
-                            "turnLatency": 800}],
+        "turn_latencies": [{"turn_id": "item_a1", "transcriber_ms": 100, "endpointing_ms": 200,
+                            "turn_ms": 800}],
     }
     assert caplog.text.count("left out of call.ended") == 2  # one line each: stt and turn_detection
 
@@ -1460,11 +1567,11 @@ async def test_a_failing_section_is_left_out_alone(http, caplog):
 
 
 async def test_retries_reuse_the_event_id(http, monkeypatch):
-    monkeypatch.setattr(test_data, "_STARTED_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(call_report, "_STARTED_TIMEOUT_S", 0.05)
     http.script["started"] = [ConnectionError("down"), (503, {"error": "unavailable"}), "hang"]
     http.script["ended"] = [(500, {}), LINKED]
     ctx = FakeCtx(FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"})))
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
 
     # the server never answered call.started, but a test ID is enough to still send call.ended
     assert await recognised(ctx) is True
@@ -1481,7 +1588,7 @@ async def test_retries_reuse_the_event_id(http, monkeypatch):
 async def test_client_errors_are_not_retried(http):
     http.script["started"] = [(401, {"error": "invalid_api_key"})]
     ctx = FakeCtx(FakeRoom([sip_participant(**{"sip.h.x-superbryn-call-id": "sbc_1"})]))
-    attach_test_data(ctx, session_with(), api_key="bad", base_url=BASE)
+    attach(ctx, session_with(), api_key="bad", base_url=BASE)
 
     await recognised(ctx)
     assert len(http.posts("call.started")) == 1
@@ -1491,7 +1598,7 @@ async def test_phone_test_whose_call_started_got_no_answer_still_sends_call_ende
     # a caller-number match has no test ID; call.ended repeats the start fields, so it can link on its own
     http.script["started"] = [(503, {"error": "unavailable"})]
     ctx = FakeCtx(FakeRoom([sip_participant()]))
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
 
     assert await recognised(ctx) is True
     await ctx.shutdown()
@@ -1506,7 +1613,7 @@ async def test_phone_test_whose_call_started_got_no_answer_still_sends_call_ende
 async def test_refused_call_started_sends_no_call_ended(http, answer):
     http.script["started"] = [answer]
     ctx = FakeCtx(FakeRoom([sip_participant()]))
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
 
     assert await recognised(ctx) is False
     await ctx.shutdown()
@@ -1517,21 +1624,21 @@ async def test_refused_call_started_sends_no_call_ended(http, answer):
 async def test_ended_at_is_when_the_session_closed_not_the_later_shutdown(http):
     session = FakeSession()
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     assert await recognised(ctx) is True
-    call = ctx.shutdown_callbacks[0].__self__
-    hung_up = call.started_ts + 60.0  # the job shuts down only once the room goes, later than this
+    report = ctx.shutdown_callbacks[0].__self__
+    hung_up = report._started_ts + 60.0  # the job shuts down only once the room goes, later than this
     session.emit("close", CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED, created_at=hung_up))
     await ctx.shutdown()
 
     [ended] = http.posts("call.ended")
-    assert ended.body["ended_at"] == test_data._iso(hung_up)
+    assert ended.body["ended_at"] == call_report._iso(hung_up)
 
 
 async def closed_body(http, session, closed_at):
     """One test call whose session closed at closed_at; its call.ended body."""
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     await recognised(ctx)
     session.emit("close", CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED, created_at=closed_at))
     await ctx.shutdown()
@@ -1573,7 +1680,7 @@ async def test_a_last_caller_line_that_really_ran_to_the_close_keeps_its_end(htt
 async def test_ended_at_is_never_before_the_start(http):
     session = FakeSession()
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session, api_key="k", base_url=BASE)
+    attach(ctx, session, api_key="k", base_url=BASE)
     session.emit("close", CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED, created_at=1.0))
     await recognised(ctx)
     await ctx.shutdown()
@@ -1586,22 +1693,22 @@ async def test_ended_at_is_never_before_the_start(http):
 # --- the job's shutdown -------------------------------------------------------
 
 
-async def test_shutdown_does_not_wait_for_a_sip_participant(http, monkeypatch):
-    monkeypatch.setattr(test_data, "_SIP_WAIT_S", 30.0)  # e.g. a web or console session, ended at once
+async def test_shutdown_does_not_wait_for_a_caller(http, monkeypatch):
+    monkeypatch.setattr(call_report, "_SIP_WAIT_S", 30.0)  # e.g. a console session, ended at once
     ctx = FakeCtx(FakeRoom([]))
-    attach_test_data(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
+    attach(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
     await asyncio.sleep(0.05)
 
     await asyncio.wait_for(ctx.shutdown(), 1)
-    assert ctx.shutdown_callbacks[0].__self__.task.cancelled()
+    assert ctx.shutdown_callbacks[0].__self__._task.cancelled()
     assert http.calls == []
 
 
 async def test_shutdown_drops_an_unfinished_caller_number_lookup(http, monkeypatch):
-    monkeypatch.setattr(test_data, "_STARTED_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(call_report, "_STARTED_TIMEOUT_S", 30.0)
     http.script["caller-numbers"] = ["hang"]
     ctx = FakeCtx(FakeRoom([sip_participant()]))  # no test ID yet
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
     await until(lambda: http.gets())
 
     await asyncio.wait_for(ctx.shutdown(), 1)
@@ -1610,10 +1717,10 @@ async def test_shutdown_drops_an_unfinished_caller_number_lookup(http, monkeypat
 
 @pytest.mark.parametrize("attributes", [{"sip.h.x-superbryn-call-id": "sbc_1"}, {}], ids=["test-id", "phone-test"])
 async def test_call_started_in_flight_at_shutdown_sends_call_ended_alone(http, monkeypatch, attributes):
-    monkeypatch.setattr(test_data, "_STARTED_TIMEOUT_S", 30.0)
+    monkeypatch.setattr(call_report, "_STARTED_TIMEOUT_S", 30.0)
     http.script["started"] = ["hang"]
     ctx = FakeCtx(FakeRoom([sip_participant(**attributes)]))
-    attach_test_data(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
+    attach(ctx, session_with(ChatMessage(role="user", content=["hi"])), api_key="k", base_url=BASE)
     await until(lambda: http.posts("call.started"))
 
     await asyncio.wait_for(ctx.shutdown(), 1)
@@ -1621,26 +1728,26 @@ async def test_call_started_in_flight_at_shutdown_sends_call_ended_alone(http, m
     [ended] = http.posts("call.ended")
     for field in ("call_id", "agent_id", "from", "to", "started_at"):
         assert ended.body[field] == started.body[field]
-    assert ended.body.get("superbryn_call_id") == attributes.get("sip.h.x-superbryn-call-id")
+    assert ended.body.get("testing", {}).get("superbryn_call_id") == attributes.get("sip.h.x-superbryn-call-id")
     assert ended.body["transcript"][0]["text"] == "hi"
 
 
 async def test_the_shutdown_work_has_one_deadline(http, monkeypatch, caplog):
-    monkeypatch.setattr(test_data, "_SHUTDOWN_S", 0.2)
+    monkeypatch.setattr(call_report, "_SHUTDOWN_S", 0.2)
     http.script["ended"] = ["hang"]
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, session_with(), api_key="k", base_url=BASE)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
     assert await recognised(ctx) is True
 
     await asyncio.wait_for(ctx.shutdown(), 1)
     assert len(http.posts("call.ended")) == 1
-    assert "SUPERBRYN_TEST_DATA_FAILED: call.ended for call RM_job1 not sent within 0.2 s of shutdown" in caplog.text
+    assert "SUPERBRYN_CALL_REPORT_FAILED: call.ended for call RM_job1 not sent within 0.2 s of shutdown" in caplog.text
 
 
 async def test_a_second_attach_in_the_same_job_is_ignored(http, caplog):
     ctx = ctx_with_test_id()
-    attach_test_data(ctx, FakeSession(chat("user", "Hi", 0)), api_key="k", base_url=BASE)
-    attach_test_data(ctx, FakeSession(chat("user", "A second session", 0)), api_key="k", base_url=BASE)
+    attach(ctx, FakeSession(chat("user", "Hi", 0)), api_key="k", base_url=BASE)
+    attach(ctx, FakeSession(chat("user", "A second session", 0)), api_key="k", base_url=BASE)
     await recognised(ctx)
     await ctx.shutdown()
 
@@ -1648,76 +1755,597 @@ async def test_a_second_attach_in_the_same_job_is_ignored(http, caplog):
     assert len(http.posts("call.started")) == 1
     [ended] = http.posts("call.ended")
     assert [turn["text"] for turn in ended.body["transcript"]] == ["Hi"]
-    assert caplog.text.count("attach_test_data already ran in this job") == 1
+    assert caplog.text.count("attach already ran in this job") == 1
 
 
 # --- settings and the call path -----------------------------------------------
 
 
-async def test_no_key_does_nothing(http, caplog):
+async def test_no_key_does_nothing_but_the_handle_still_works(http, caplog):
     caplog.set_level(logging.INFO)
     for name in ("call-room-1", "call-room-2"):
         ctx = FakeCtx(FakeRoom([sip_participant()], name=name), job_room_name=name)
-        assert attach_test_data(ctx, session_with()) is None
+        report = attach(ctx, session_with(), custom_data={"team_id": "t-1"})
+        report.update_custom_data({"resolved": True})
+        report.set_call_end_reason("done")
         assert ctx.shutdown_callbacks == []
 
-    assert not [t for t in asyncio.all_tasks() if t.get_name() == "superbryn_test_data"]
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "superbryn_call_report"]
     await asyncio.sleep(0.05)
     assert http.calls == []
-    assert caplog.text.count("SUPERBRYN_TEST_DATA_DISABLED") == 1
+    assert caplog.text.count("SUPERBRYN_CALL_REPORT_DISABLED") == 1
 
 
-async def test_settings_come_from_env(http, monkeypatch):
-    monkeypatch.setenv("SUPERBRYN_API_KEY", "obs_key")
+async def test_settings_come_from_env_and_webhook_url_is_not_read(http, monkeypatch):
+    monkeypatch.setenv("SUPERBRYN_API_KEY", "env_key")
+    monkeypatch.setenv("SUPERBRYN_TEST_API_KEY", "old_test_key")  # 0.3.x's eval-mode key: not read
+    monkeypatch.setenv("WEBHOOK_URL", "https://old.test/webhooks/obs/livekit")  # 0.3.x's route: never posted to
     metadata = json.dumps({"superbryn_call_id": "sbc_1"})
     ctx = FakeCtx(FakeRoom([sip_participant()]), job_metadata=metadata)
-    attach_test_data(ctx, session_with())
+    attach(ctx, session_with())
     await recognised(ctx)
     [started] = http.posts("call.started")
-    assert started.url == "https://api.superbryn.com/public-api/v1/test-calls/agent-data"
-    assert started.headers["X-API-Key"] == "obs_key"
+    assert started.url == "https://api.superbryn.com/public-api/v1/calls/agent-data"
+    assert started.headers["X-API-Key"] == "env_key"
     assert started.body["agent_id"] == AGENT_UUID
 
     other_uuid = "11111111-2222-4333-8444-555555555555"
-    monkeypatch.setenv("SUPERBRYN_TEST_API_KEY", "test_key")
     monkeypatch.setenv("SUPERBRYN_BASE_URL", "https://env.test/")
     monkeypatch.setenv("SUPERBRYN_AGENT_ID", other_uuid)
     ctx2 = FakeCtx(FakeRoom([sip_participant()], name="call-room-2"), job_metadata=metadata,
                    job_room_name="call-room-2")
-    attach_test_data(ctx2, session_with())
+    attach(ctx2, session_with())
     await recognised(ctx2)
     started2 = http.posts("call.started")[1]
-    assert started2.url == "https://env.test/public-api/v1/test-calls/agent-data"
-    assert started2.headers["X-API-Key"] == "test_key"
+    assert started2.url == "https://env.test/public-api/v1/calls/agent-data"
     assert started2.body["agent_id"] == other_uuid
+    assert all("old.test" not in c.url for c in http.calls)
 
 
 @pytest.mark.parametrize("agent", [None, "my-agent", "4347a69f-0c1e-0b6a-9f1e-2b3c4d5e6f70"],
                          ids=["missing", "name", "version-0"])
-async def test_no_valid_agent_id_sends_nothing(http, monkeypatch, caplog, agent):
+async def test_an_agent_id_that_is_not_a_uuid_is_left_out(http, monkeypatch, caplog, agent):
+    # the server refuses a whole report whose agent_id is not a UUID; an agent key names the agent itself
     caplog.set_level(logging.INFO)
     monkeypatch.delenv("SUPERBRYN_AGENT_ID")
-    monkeypatch.setenv("AGENT_ID", AGENT_UUID)  # Observability's variable: never read here
+    monkeypatch.setenv("AGENT_ID", "support-agent")  # 0.3.x's free-form name: never read
     metadata = json.dumps({"superbryn_call_id": "sbc_1"})
     for name in ("call-room-1", "call-room-2"):
         ctx = FakeCtx(FakeRoom([sip_participant()], name=name), job_metadata=metadata, job_room_name=name)
-        attach_test_data(ctx, session_with(), api_key="k", agent_id=agent)
-        assert ctx.shutdown_callbacks == []
+        attach(ctx, session_with(), api_key="k", agent_id=agent, base_url=BASE)
+        await recognised(ctx)
 
-    await asyncio.sleep(0.05)
-    assert http.calls == []
-    assert caplog.text.count("SUPERBRYN_TEST_DATA_DISABLED") == 1
-    assert (f"{agent!r} is not a SuperBryn agent ID" if agent else "no agent ID, set SUPERBRYN_AGENT_ID") in caplog.text
+    assert len(http.posts("call.started")) == 2
+    assert all("agent_id" not in c.body for c in http.calls)
+    assert caplog.text.count("is not a SuperBryn agent ID") == (1 if agent else 0)
 
 
-async def test_attach_returns_without_awaiting(http):
-    assert not inspect.iscoroutinefunction(attach_test_data)
+async def test_attach_returns_its_handle_without_awaiting(http):
+    assert not inspect.iscoroutinefunction(attach)
     ctx = FakeCtx(FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"})))
 
-    assert attach_test_data(ctx, session_with(), api_key="k", base_url=BASE) is None
+    report = attach(ctx, session_with(), api_key="k", base_url=BASE)
+    assert isinstance(report, call_report.CallReport)
     assert http.calls == []  # nothing ran on the call path
     assert len(ctx.shutdown_callbacks) == 1
 
     await recognised(ctx)
     await ctx.shutdown()
     assert [c.body["event"] for c in http.calls] == ["call.started", "call.ended"]
+
+
+# --- production calls (surface "observability") -------------------------------
+
+
+async def production_call(http, participants, session=None, **options):
+    """Run one call that is not a SuperBryn test through shutdown: (ctx, call.started, call.ended)."""
+    ctx = FakeCtx(FakeRoom(participants))
+    attach(ctx, session or FakeSession(chat("user", "Hi", 1.0)), api_key="k", base_url=BASE, **options)
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+    [started], [ended] = http.posts("call.started"), http.posts("call.ended")
+    return ctx, started.body, ended.body
+
+
+async def test_a_call_that_is_not_a_test_is_a_production_call_with_a_stereo_recording(http, recorders):
+    ctx, started, ended = await production_call(http, [sip_participant(phone="+12125550123")])
+
+    assert started == {
+        "schema_version": 1, "event_id": "lk:RM_job1:started", "event": "call.started", "surface": "observability",
+        "source": "livekit", "call_id": "RM_job1", "agent_id": AGENT_UUID, "from": "+12125550123",
+        "to": THEIR_NUMBER, "started_at": "2025-10-09T08:53:20.000Z", "observability": {"direction": "inbound"}}
+    url = "https://recordings.test/call_recordings/call-room-1/20251009-085320/call.mp3"
+    assert ended["observability"] == {"direction": "inbound", "recording_url": url, "stereo_recording_url": url,
+                                      "recording_url_source": "superbryn_s3"}
+    assert ended["surface"] == "observability" and "testing" not in ended
+    [recorder] = recorders
+    # with SuperBryn's credentials for this key, of the room by name; stopped when the call ends
+    assert (recorder.credentials_url, recorder.api_key) == (BASE + "/api/recording-credentials", "k")
+    assert recorder.rooms == ["call-room-1"] and recorder.stopped
+
+
+async def test_record_false_reports_a_production_call_without_a_recording(http, recorders):
+    ctx, started, ended = await production_call(http, [sip_participant(phone="+12125550123")], record=False)
+
+    assert recorders == []
+    assert ended["surface"] == "observability" and ended["observability"] == {"direction": "inbound"}
+    assert started["observability"] == {"direction": "inbound"}
+
+
+async def test_record_false_leaves_a_recording_set_by_the_agent(http, recorders):
+    ctx = FakeCtx(FakeRoom([sip_participant(phone="+12125550123")]))
+    report = attach(ctx, FakeSession(chat("user", "Hi", 1.0)), api_key="k", base_url=BASE, record=False)
+    report.set_recording_url("https://example.test/their.mp3")
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+    [ended] = http.posts("call.ended")
+    assert recorders == []
+    assert ended.body["observability"] == {"direction": "inbound", "recording_url": "https://example.test/their.mp3",
+                                           "recording_url_source": "external"}
+
+
+async def test_an_outbound_call_and_a_web_call(http, recorders):
+    _, started, _ = await production_call(http, [sip_participant(phone="+12125550123", rule="")])
+    assert (started["from"], started["to"], started["observability"]) == (
+        THEIR_NUMBER, "+12125550123", {"direction": "outbound"})
+
+    http.calls.clear()
+    # a caller in a browser: no numbers and no direction, and no wait for a SIP participant
+    ctx, started, ended = await production_call(http, [web_participant(joined=T0 + 2)])
+    assert {"from", "to", "observability"}.isdisjoint(started)
+    assert started["started_at"] == "2025-10-09T08:53:22.000Z"
+    assert ended["context"]["participant_identity"] == "web-user"
+    assert ended["observability"]["recording_url_source"] == "superbryn_s3"
+
+
+async def test_a_test_call_is_never_recorded_and_a_denied_one_is_not_reported_again(http, recorders):
+    http.script["started"] = [(200, {"surface": "testing", "status": "ignored", "is_test": False,
+                                     "reason": "not_a_test"})]
+    ctx = FakeCtx(FakeRoom([sip_participant()]))  # our caller number: a test call
+    attach(ctx, FakeSession(chat("user", "Hi", 1.0)), api_key="k", base_url=BASE)
+
+    assert await recognised(ctx) is False
+    await ctx.shutdown()
+    assert [c.body["surface"] for c in http.calls if c.method == "POST"] == ["testing"]  # reported once only
+    assert recorders == []
+
+
+async def test_your_own_recording_is_sent_instead_and_ours_is_not_started(http, recorders):
+    own = "https://my-bucket.example/calls/room-1.mp3?X-Amz-Signature=abc"
+    ctx = FakeCtx(FakeRoom([sip_participant(phone="+12125550123")]))
+    report = attach(ctx, FakeSession(), api_key="k", base_url=BASE)
+    report.set_recording_url(own)
+    await recognised(ctx)
+    await ctx.shutdown()
+
+    [ended] = http.posts("call.ended")
+    assert ended.body["observability"] == {"direction": "inbound", "recording_url": own,
+                                           "recording_url_source": "external"}
+    assert recorders == []
+
+
+async def test_a_recording_that_fails_to_start_leaves_the_call_reported(http, monkeypatch, caplog):
+    def broken(*args, **kwargs):
+        raise ValueError("url is required")  # e.g. LIVEKIT_URL is not set
+
+    monkeypatch.setattr(call_report, "RecordingManager", broken)
+    _, _, ended = await production_call(http, [sip_participant(phone="+12125550123")])
+
+    assert ended["observability"] == {"direction": "inbound"}
+    assert "recording not started: url is required" in caplog.text
+
+
+async def test_a_key_without_test_data_write_still_reports_production_calls(http, caplog):
+    http.script["caller-numbers"] = [(403, {"code": "insufficient_scope"})]
+    _, started, _ = await production_call(http, [sip_participant()])  # our number, but it can't be checked
+
+    assert started["surface"] == "observability"
+    assert caplog.text.count("caller numbers were refused (HTTP 403)") == 1
+    assert "SUPERBRYN_CALL_REPORT_REJECTED" not in [r.message[:30] for r in caplog.records if r.levelname == "ERROR"]
+
+
+# --- what every report carries -------------------------------------------------
+
+
+async def test_custom_data_is_sent_as_given_and_changes_until_the_call_ends(http):
+    ctx = FakeCtx(FakeRoom([sip_participant(phone="+12125550123")]))
+    report = attach(ctx, FakeSession(), api_key="k", base_url=BASE,
+                    custom_data={"enterprise_id": "ent_42", "team_id": 7, "agent_type_id": "sales_inbound"})
+    await recognised(ctx)
+    report.update_custom_data({"lead_score": 0.82, "tags": ["vip"], "booked": True, "note": None})
+    await ctx.shutdown()
+
+    [started] = http.posts("call.started")
+    [ended] = http.posts("call.ended")
+    assert "custom_data" not in started.body  # call.started carries identity only
+    assert ended.body["custom_data"] == {"enterprise_id": "ent_42", "team_id": 7, "agent_type_id": "sales_inbound",
+                                         "lead_score": 0.82, "tags": ["vip"], "booked": True, "note": None}
+
+    http.calls.clear()
+    ctx = FakeCtx(FakeRoom([sip_participant(phone="+12125550123")]))
+    report = attach(ctx, FakeSession(), api_key="k", base_url=BASE, custom_data={"enterprise_id": "ent_42"})
+    report.set_custom_data({"team_id": "t-1", "at": datetime(2026, 10, 28, tzinfo=timezone.utc)})  # replaces it
+    await recognised(ctx)
+    await ctx.shutdown()
+    assert http.posts("call.ended")[0].body["custom_data"] == {"team_id": "t-1", "at": "2026-10-28 00:00:00+00:00"}
+
+
+async def test_custom_data_strict_json_cannot_hold_is_left_out_alone(http, caplog):
+    ctx = FakeCtx(FakeRoom([sip_participant(phone="+12125550123")]))
+    attach(ctx, FakeSession(chat("user", "Hi", 1.0)), api_key="k", base_url=BASE, custom_data={"ratio": float("nan")})
+    await recognised(ctx)
+    await ctx.shutdown()
+
+    [ended] = http.posts("call.ended")
+    assert "custom_data" not in ended.body and ended.body["transcript"][0]["text"] == "Hi"
+    assert "custom_data left out of call.ended" in caplog.text
+
+
+@pytest.mark.parametrize(("close", "left", "expected"), [
+    (CloseReason.PARTICIPANT_DISCONNECTED, rtc.DisconnectReason.CLIENT_INITIATED, "caller"),
+    (CloseReason.PARTICIPANT_DISCONNECTED, rtc.DisconnectReason.ROOM_DELETED, "agent"),  # the agent hung up
+    (CloseReason.USER_INITIATED, None, "agent"),  # session.shutdown(), e.g. LiveKit's EndCallTool
+    (CloseReason.TASK_COMPLETED, None, "agent"),
+    (CloseReason.ERROR, None, "system"),
+    (CloseReason.JOB_SHUTDOWN, None, "system"),
+    (CloseReason.JOB_SHUTDOWN, rtc.DisconnectReason.CLIENT_INITIATED, "caller"),  # the caller left first
+    (None, None, None),  # the session never closed before the job's shutdown
+    (CloseReason.JOB_SHUTDOWN, rtc.DisconnectReason.USER_UNAVAILABLE, "caller"),  # no answer: the agent's code shut down
+    (CloseReason.PARTICIPANT_DISCONNECTED, rtc.DisconnectReason.USER_REJECTED, "caller"),
+    (CloseReason.JOB_SHUTDOWN, rtc.DisconnectReason.SIP_TRUNK_FAILURE, "system"),
+], ids=["caller-hung-up", "room-deleted", "user-initiated", "task-completed", "error", "job-shutdown",
+        "caller-left-then-shutdown", "unknown", "no-answer", "rejected", "trunk-failure"])
+async def test_ended_by(http, close, left, expected):
+    participant = sip_participant(phone="+12125550123")
+    session = FakeSession()
+    ctx = FakeCtx(FakeRoom([participant]))
+    attach(ctx, session, api_key="k", base_url=BASE)
+    await recognised(ctx)
+    participant.disconnect_reason = left
+    if close is not None:
+        session.emit("close", CloseEvent(reason=close))
+    await ctx.shutdown()
+
+    assert http.posts("call.ended")[0].body.get("ended_by") == expected
+
+
+def outbound_call(monkeypatch, status="dialing"):
+    """An outbound phone call LiveKit is still dialling, on a clock tests move: (now, caller, room, ctx)."""
+    now = [T0 + 5.0]
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: now[0], monotonic=lambda: 100.0))
+    caller = sip_participant(phone="+12125550123", rule="", **{"sip.callStatus": status})  # joined, i.e. dialled, at T0
+    room = FakeRoom([caller])
+    return now, caller, room, FakeCtx(room)
+
+
+def iso_at(seconds):
+    return datetime.fromtimestamp(T0 + seconds, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+async def test_an_outbound_call_counts_from_its_answer_and_rings_from_its_dialling(http, monkeypatch, recorders):
+    now, caller, room, ctx = outbound_call(monkeypatch)
+    attach(ctx, FakeSession(chat("user", "Hi", 23.0)), api_key="k", base_url=BASE)
+    await until(lambda: room.handlers.get("participant_attributes_changed"))
+    assert http.posts("call.started") == [] and recorders == []  # still ringing: no call yet, nothing recorded
+
+    now[0] = T0 + 20.0
+    caller.attributes["sip.callStatus"] = "active"
+    room.emit("participant_attributes_changed", {"sip.callStatus": "active"}, caller)
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+
+    [started], [ended] = http.posts("call.started"), http.posts("call.ended")
+    assert started.body["started_at"] == iso_at(20.0)
+    assert ended.body["context"]["ring_started_at"] == iso_at(0.0)
+    assert ended.body["transcript"][0]["start_ms"] == 3000  # from the answer, not the dialling
+    assert len(recorders) == 1 and ended.body["ended_reason"] == "room disconnected"  # an answered call's own reason
+    assert not room.handlers["participant_attributes_changed"]  # stopped listening once answered
+
+
+@pytest.mark.parametrize(("left", "reason", "by"), [
+    (rtc.DisconnectReason.USER_UNAVAILABLE, "user_unavailable", "caller"),
+    (rtc.DisconnectReason.USER_REJECTED, "user_rejected", "caller"),
+    (rtc.DisconnectReason.SIP_TRUNK_FAILURE, "sip_trunk_failure", "system"),
+], ids=["no-answer", "rejected", "trunk-failure"])
+async def test_a_call_that_never_connected_says_why_and_is_not_recorded(http, monkeypatch, recorders, left, reason, by):
+    now, caller, room, ctx = outbound_call(monkeypatch)
+    attach(ctx, FakeSession(), api_key="k", base_url=BASE)
+    await until(lambda: room.handlers.get("participant_attributes_changed"))
+    now[0] = T0 + 30.0
+    caller.disconnect_reason = left
+    del room.remote_participants[caller.identity]
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+
+    [started], [ended] = http.posts("call.started"), http.posts("call.ended")
+    assert started.body["started_at"] == iso_at(0.0)  # it never connected: it counts from the dialling
+    assert (ended.body["ended_reason"], ended.body["ended_by"]) == (reason, by)
+    assert recorders == []
+
+
+async def test_a_call_still_ringing_at_shutdown_is_reported_as_not_answered(http, monkeypatch, recorders):
+    _, _, room, ctx = outbound_call(monkeypatch, status="ringing")
+    attach(ctx, FakeSession(), api_key="k", base_url=BASE)
+    await until(lambda: room.handlers.get("participant_attributes_changed"))
+    await ctx.shutdown()
+
+    [ended] = http.posts("call.ended")
+    assert ended.body["ended_reason"] == "not_answered" and ended.body["started_at"] == iso_at(0.0)
+    assert recorders == []
+
+
+async def test_an_inbound_call_counts_from_when_it_joined_and_never_waits_for_the_answer(http, monkeypatch, recorders):
+    # LiveKit shows an inbound call "ringing" until the agent's audio reaches it; that is not waited for
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: T0 + 5.0, monotonic=lambda: 100.0))
+    caller = sip_participant(phone="+12125550123", **{"sip.callStatus": "ringing"})  # sip.ruleID set: inbound
+    room = FakeRoom([caller])
+    ctx = FakeCtx(room)
+    attach(ctx, FakeSession(chat("user", "Hi", 1.0)), api_key="k", base_url=BASE)
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+
+    [started], [ended] = http.posts("call.started"), http.posts("call.ended")
+    assert started.body["started_at"] == iso_at(0.0) and len(recorders) == 1
+    assert "participant_attributes_changed" not in room.handlers
+    assert ended.body["ended_reason"] == "room disconnected"  # still "ringing" at the end: not "not_answered"
+
+
+async def test_a_call_already_answered_when_attached_counts_from_then(http, monkeypatch):
+    now, _, _, ctx = outbound_call(monkeypatch, status="active")  # e.g. dialled with wait_until_answered=True
+    attach(ctx, FakeSession(), api_key="k", base_url=BASE)
+    assert await recognised(ctx) is True
+    assert http.posts("call.started")[0].body["started_at"] == iso_at(5.0)
+
+
+async def test_your_end_reason_wins_and_a_failed_session_sends_its_error(http):
+    session = FakeSession()
+    ctx = FakeCtx(FakeRoom([sip_participant(phone="+12125550123")]))
+    report = attach(ctx, session, api_key="k", base_url=BASE)
+    await recognised(ctx)
+    report.set_call_end_reason("  transfer_to_human ")
+    error = llm.LLMError(timestamp=T0 + 5, label="openai.LLM",
+                         error=RuntimeError("quota exceeded for key sk_" + "a" * 40), recoverable=False)
+    session.emit("close", CloseEvent(reason=CloseReason.ERROR, error=error))
+    await ctx.shutdown()
+
+    [ended] = http.posts("call.ended")
+    assert (ended.body["ended_reason"], ended.body["ended_by"]) == ("transfer_to_human", "system")
+    assert ended.body["context"]["close"] == {"error_type": "llm_error",
+                                              "error_message": "openai.LLM: quota exceeded for key ***"}
+
+
+async def test_context_names_the_first_agent_s_prompt_the_room_and_the_caller(http, monkeypatch):
+    pushed = []
+
+    async def push_prompt(**kwargs):
+        pushed.append(kwargs)
+        return True
+
+    monkeypatch.setattr(call_report, "push_prompt", push_prompt)
+    session = FakeSession()  # attached before session.start(): no agent is running yet
+    room = FakeRoom([sip_participant(phone="+12125550123")])
+    room.creation_time = datetime.fromtimestamp(T0 - 2.4, timezone.utc)
+    ctx = FakeCtx(room)
+    attach(ctx, session, api_key="k", base_url=BASE, prompt="You are {{name}}.", prompt_version="v3")
+    session.agent = Agent(instructions="You are Ava. Caller: Riley.")  # the first agent becomes active
+    session.emit("agent_state_changed", AgentStateChangedEvent(old_state="initializing", new_state="listening"))
+    await recognised(ctx)
+    session.agent = Agent(instructions="You are Ben, in billing.")  # a handoff: its prompt is not sent
+    session.emit("agent_state_changed", AgentStateChangedEvent(old_state="listening", new_state="speaking"))
+    await ctx.shutdown()
+
+    context = http.posts("call.ended")[0].body["context"]
+    environment = context.pop("environment")
+    assert context == {
+        "system_prompt": "You are Ava. Caller: Riley.",
+        "prompt_ref": {"hash": call_report.prompt_ref("You are {{name}}.")["hash"], "version": "v3"},
+        "room_name": "call-room-1",
+        "participant_identity": "sip_+12125550123",
+        "ring_started_at": "2025-10-09T08:53:17.600Z",
+    }
+    assert environment["livekit_evals_version"] == "0.4.0"
+    assert set(environment) == {"livekit_evals_version", "livekit_agents_version", "livekit_rtc_version",
+                                "python_version"}
+    assert pushed == [{"api_key": "k", "api_base_url": BASE, "template": "You are {{name}}.", "version": "v3",
+                       "agent_id": AGENT_UUID}]  # an org key's push names its agent
+
+
+async def test_the_system_prompt_is_the_first_agent_s_instructions_as_rendered(http):
+    chat_context = pytest.importorskip("livekit.agents.llm.chat_context")
+    if not hasattr(chat_context, "Instructions"):
+        pytest.skip("a livekit-agents 1.8 feature")
+    instructions = chat_context.Instructions("You are Ava.", audio="Keep it short.", text="Use markdown.")
+    body = await ended_body(http, FakeSession(agent=Agent(instructions=instructions)))
+
+    assert body["context"]["system_prompt"] == instructions.render(modality="audio")
+
+
+def eou_event(at, waited, transcribed):
+    """A recorded metrics_collected event for one caller turn the turn detector closed."""
+    metrics = SimpleNamespace(type="eou_metrics", timestamp=T0 + at, end_of_utterance_delay=waited,
+                              transcription_delay=transcribed, on_user_turn_completed_delay=0.002)
+    return SimpleNamespace(type="metrics_collected", metrics=metrics)
+
+
+async def test_end_of_turn_events_and_keypresses_are_sent_raw(http, monkeypatch):
+    clock = SimpleNamespace(now=T0)
+    monkeypatch.setattr(call_report, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
+    session = FakeSession(chat("user", "Press one", 1.0))
+    session._recorded_events = [eou_event(6.78, 0.58, 0.21), eou_event(9.0, 0.0, 0.0)]  # 0: no end of speech seen
+    ctx = ctx_with_test_id()
+    attach(ctx, session, api_key="k", base_url=BASE)
+    await recognised(ctx)
+    clock.now = T0 + 12.1
+    ctx.room.emit("sip_dtmf_received", SimpleNamespace(code=1, digit="1"))
+    clock.now = T0 + 13.0
+    ctx.room.emit("sip_dtmf_received", SimpleNamespace(code=11, digit="#"))
+    await ctx.shutdown()
+
+    diagnostics = http.posts("call.ended")[0].body["diagnostics"]
+    assert diagnostics["eou_events"] == [{"at_ms": 6780, "eou_delay_ms": 580, "transcription_delay_ms": 210},
+                                         {"at_ms": 9000}]
+    assert diagnostics["dtmf"] == [{"at_ms": 12100, "digit": "1"}, {"at_ms": 13000, "digit": "#"}]
+    assert ctx.room.handlers["sip_dtmf_received"] == []  # let go of the room when the call ends
+
+
+async def test_each_agent_line_names_its_provider_request(http):
+    session = FakeSession(
+        chat("assistant", "Hello!", 0.5, id="item_a1", metrics={"provider_request_ids": ["chatcmpl-1", "chatcmpl-2"]}),
+        chat("user", "Hi", 1.0, id="item_u1", metrics={"provider_request_ids": ["not-for-callers"]}),
+        chat("assistant", "Bye.", 2.0, id="item_a2", metrics={"provider_request_ids": []}),
+    )
+    transcript = (await ended_body(http, session))["transcript"]
+
+    assert [turn.get("provider_request_id") for turn in transcript] == ["chatcmpl-1", None, None]
+
+
+async def test_stt_language_is_sent_and_caller_line_language_and_handoffs_are_not(http):
+    session = FakeSession(
+        AgentHandoff(old_agent_id=None, new_agent_id="default_agent", created_at=T0),
+        chat("user", "नमस्ते", 1.0, id="u1"),
+        AgentHandoff(old_agent_id="default_agent", new_agent_id="billing_agent", created_at=T0 + 2),
+        chat("assistant", "Billing here.", 3.0, id="a1"),
+        stt=SimpleNamespace(model="deepgram/nova-3", provider="livekit", _opts=SimpleNamespace(language="multi")))
+    session._recorded_events = [SimpleNamespace(type="user_input_transcribed", is_final=True, item_id="u1",
+                                                language="hi")]
+    body = await ended_body(http, session)
+
+    assert body["transcript"][0] == {"id": "u1", "role": "user", "text": "नमस्ते", "start_ms": 1000}
+    assert all("agent_id" not in turn for turn in body["transcript"])
+    assert "agent_handoffs" not in body["diagnostics"]
+    assert body["diagnostics"]["configuration"]["stt"]["language"] == "multi"
+
+
+def test_a_realtime_model_is_named_not_its_helper():
+    model = Realtime(model="openai/gpt-live-1", provider="livekit")
+    usage = [SimpleNamespace(type="llm_usage", provider="livekit", model="gpt-5.6-luna", input_tokens=900,
+                             output_tokens=100)]
+    assert call_report._component(SimpleNamespace(llm=model), "llm", usage)["model"] == "openai/gpt-live-1"
+
+
+async def test_the_answer_is_watched_from_when_the_caller_joined_even_while_the_lookup_is_slow(http, monkeypatch,
+                                                                                            recorders):
+    now, caller, room, ctx = outbound_call(monkeypatch)
+    lookup_done = asyncio.Event()
+
+    async def slow_lookup(*args):
+        await lookup_done.wait()
+        return False
+
+    monkeypatch.setattr(call_report, "_is_caller_number", slow_lookup)
+    attach(ctx, FakeSession(chat("user", "Hi", 23.0)), api_key="k", base_url=BASE)
+    await until(lambda: room.handlers.get("participant_attributes_changed"))  # watching while the lookup still runs
+    now[0] = T0 + 20.0
+    caller.attributes["sip.callStatus"] = "active"
+    room.emit("participant_attributes_changed", {"sip.callStatus": "active"}, caller)
+    now[0] = T0 + 40.0
+    lookup_done.set()
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+
+    [started] = http.posts("call.started")
+    assert started.body["started_at"] == iso_at(20.0)  # the answer, not when the lookup came back
+
+
+def test_the_handle_never_raises_on_values_it_cannot_take(caplog):
+    report = call_report.CallReport()
+    report.set_custom_data({"team_id": "t-42"})
+    report.set_custom_data(None)
+    report.update_custom_data(["not", "a", "dict"])
+    report.set_call_end_reason(5)
+    report.set_recording_url(5)
+    assert report._custom_data == {"team_id": "t-42"} and report._external_recording is None
+    assert "update_custom_data takes a dict, got list" in caplog.text
+    report.set_call_end_reason("x" * 300)
+    assert len(report._end_reason) == 200
+
+
+async def test_a_tool_call_without_a_name_is_left_out(http):
+    session = session_with(
+        FunctionCall(call_id="call_1", name="", arguments="{}", created_at=T0 + 1.0),
+        FunctionCall(call_id="call_2", name="lookup_order", arguments="{}", created_at=T0 + 2.0),
+    )
+    ctx = FakeCtx(FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"})))
+    attach(ctx, session, api_key="k", agent_id=AGENT_UUID, base_url=BASE)
+    await recognised(ctx)
+    await ctx.shutdown()
+
+    [ended] = http.posts("call.ended")
+    assert [t["name"] for t in ended.body["tool_calls"]] == ["lookup_order"]
+
+
+async def test_a_long_room_name_used_as_the_call_id_keeps_the_event_id_within_200(http):
+    room = FakeRoom([sip_participant()], metadata=json.dumps({"superbryn_call_id": "sbc_1"}), sid="", plain_sid=True)
+    ctx = FakeCtx(room, job_room_sid="", job_room_name="r" * 250)
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
+    await recognised(ctx)
+
+    [started] = http.posts("call.started")
+    assert started.body["call_id"] == "r" * 189 and len(started.body["event_id"]) == 200
+
+
+def test_the_refusal_hint_reads_the_servers_error_code():
+    assert "SUPERBRYN_AGENT_ID" in call_report._refusal_hint(400, {"error": {"code": "agent_id_required"}})
+    assert "not this key's agent" in call_report._refusal_hint(403, {"error": {"code": "agent_key_mismatch"}})
+    assert "test_data:write" in call_report._refusal_hint(403, {"error": {"code": "insufficient_scope"}})
+
+
+async def test_a_console_run_sends_nothing(http):
+    ctx = FakeCtx(FakeRoom([]))
+    ctx.is_fake_job = lambda: True
+    attach(ctx, session_with(), api_key="k", base_url=BASE)
+    assert ctx.shutdown_callbacks == [] and http.posts("call.started") == []
+
+
+async def test_a_recording_that_gives_no_url_is_logged_under_the_package(http, monkeypatch, caplog):
+    class NoUrl:
+        def __init__(self, **kwargs):
+            pass
+
+        async def start_recording(self, room_name):
+            return None
+
+        async def stop_recording(self):
+            pass
+
+    monkeypatch.setattr(call_report, "RecordingManager", NoUrl)
+    _, _, ended = await production_call(http, [sip_participant(phone="+12125550123")])
+
+    assert "SUPERBRYN_CALL_REPORT_ERROR: recording not started for call RM_job1" in caplog.text
+    assert "recording_url" not in ended["observability"]
+
+
+def test_custom_data_takes_any_mapping_and_attach_never_raises_on_what_it_is_given(http, caplog):
+    from collections import UserDict
+    from types import MappingProxyType
+
+    report = call_report.CallReport()
+    report.set_custom_data(MappingProxyType({"team_id": "t-42"}))
+    report.update_custom_data(UserDict({"enterprise_id": "e-1"}))
+    assert report._custom_data == {"team_id": "t-42", "enterprise_id": "e-1"}
+
+    class Ambiguous:  # like a numpy array: asking whether it is empty raises
+        def __bool__(self):
+            raise ValueError("truth value is ambiguous")
+
+    handle = attach(FakeCtx(FakeRoom([])), session_with(), api_key="k", base_url=BASE, custom_data=Ambiguous())
+    assert handle._custom_data == {} and "set_custom_data takes a dict, got Ambiguous" in caplog.text
+    handle.set_call_end_reason(5)
+    assert "set_call_end_reason takes text, got int" in caplog.text
+
+
+async def test_an_answer_watch_that_fails_counts_the_call_from_when_the_caller_joined(http, monkeypatch, recorders, caplog):
+    now, caller, room, ctx = outbound_call(monkeypatch)
+
+    async def broken(*args):
+        raise RuntimeError("no attributes")
+
+    monkeypatch.setattr(call_report, "_wait_for_answer", broken)
+    attach(ctx, FakeSession(chat("user", "Hi", 3.0)), api_key="k", base_url=BASE)
+    assert await recognised(ctx) is True
+    await ctx.shutdown()
+
+    [started], [ended] = http.posts("call.started"), http.posts("call.ended")
+    assert started.body["started_at"] == iso_at(0.0) and len(recorders) == 1
+    assert ended.body["ended_reason"] == "room disconnected"
+    assert "could not watch for the answer: no attributes" in caplog.text

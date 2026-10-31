@@ -17,7 +17,7 @@ from livekit.agents import (
 from livekit.plugins import openai
 
 # Import livekit-evals
-from livekit_evals import create_webhook_handler
+from livekit_evals import attach
 
 logger = logging.getLogger("agent")
 
@@ -41,14 +41,6 @@ async def entrypoint(ctx: JobContext):
     # Logging setup
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # ============================================================================
-    # LIVEKIT-EVALS INTEGRATION - STEP 1: Create webhook handler
-    # ============================================================================
-    webhook_handler = create_webhook_handler(
-        room=ctx.room,
-        is_deployed_on_lk_cloud=True
-    )
-
     # Set up session with OpenAI Realtime Model
     # This is simpler than voice pipeline - no separate STT/TTS/LLM configuration
     session = AgentSession(
@@ -59,16 +51,13 @@ async def entrypoint(ctx: JobContext):
         )
     )
 
+    # ============================================================================
+    # LIVEKIT-EVALS: report this call to SuperBryn (before session.start()); works the same with realtime models
+    # ============================================================================
+    attach(ctx, session)
+
     # Start the session
     await session.start(agent=Assistant(), room=ctx.room)
-
-    # ============================================================================
-    # LIVEKIT-EVALS INTEGRATION - STEP 2 & 3: Attach to session and register callback
-    # ============================================================================
-    # Works the same way with realtime models!
-    if webhook_handler:
-        webhook_handler.attach_to_session(session)
-        ctx.add_shutdown_callback(webhook_handler.send_webhook)
 
     # Connect to room
     await ctx.connect()
