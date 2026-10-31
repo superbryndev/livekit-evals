@@ -18,15 +18,10 @@ def test_imports():
         import livekit_evals
         print(f"✓ livekit_evals imported successfully (version {livekit_evals.__version__})")
         
-        # Test webhook_handler imports
-        from livekit_evals import WebhookHandler, create_webhook_handler
-        print("✓ WebhookHandler imported successfully")
-        print("✓ create_webhook_handler imported successfully")
-        
-        # Test that classes are accessible
-        assert WebhookHandler is not None
-        assert create_webhook_handler is not None
-        assert callable(create_webhook_handler)
+        # Test the entry point
+        from livekit_evals import CallReport, attach
+        print("✓ attach imported successfully")
+        assert callable(attach) and CallReport is not None
         print("✓ All imports are callable/accessible")
         
         # Test version
@@ -36,8 +31,7 @@ def test_imports():
         
         # Test __all__ exports
         assert hasattr(livekit_evals, '__all__')
-        assert 'WebhookHandler' in livekit_evals.__all__
-        assert 'create_webhook_handler' in livekit_evals.__all__
+        assert 'attach' in livekit_evals.__all__
         print("✓ __all__ exports are correct")
         
         print("\n✅ All tests passed! Package is working correctly.")

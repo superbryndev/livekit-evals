@@ -38,8 +38,9 @@ python realtime_model_agent.py dev
 
 2. **Set up environment variables** (create `.env` file):
    ```env
-   # Required for livekit-evals
+   # livekit-evals: one key with test_data:write and obs:write; the agent ID is needed with an org key
    SUPERBRYN_API_KEY=your_api_key_here
+   SUPERBRYN_AGENT_ID=your_superbryn_agent_uuid
    
    # LiveKit credentials
    LIVEKIT_URL=wss://your-project.livekit.cloud
@@ -57,7 +58,7 @@ python realtime_model_agent.py dev
    - OpenAI: [https://platform.openai.com/api-keys](https://platform.openai.com/api-keys)
    - Deepgram: [https://console.deepgram.com](https://console.deepgram.com)
    - Cartesia: [https://cartesia.ai](https://cartesia.ai)
-   - Superbryn (livekit-evals): [https://your-platform.com/api-keys](https://your-platform.com/api-keys) *(placeholder)*
+   - SuperBryn (livekit-evals): in [app.superbryn.com](https://app.superbryn.com), Monitor > Add Source > LiveKit
 
 ## Testing Locally
 
@@ -69,38 +70,21 @@ python basic_agent.py dev
 
 This will start the agent and open a browser window where you can test the voice interaction.
 
-## Key Integration Points
+## Key Integration Point
 
-Both examples show the same 3-line integration pattern:
+Both examples add the same one line, before `session.start()`:
 
 ```python
-# 1. Create handler (before session setup)
-webhook_handler = create_webhook_handler(
-    room=ctx.room,
-    is_deployed_on_lk_cloud=True
-)
+from livekit_evals import attach
 
-# 2. Start your session
+report = attach(ctx, session)  # registers its own shutdown hook
 await session.start(agent=YourAgent(), room=ctx.room)
-
-# 3. Attach handler (after session.start, before ctx.connect)
-if webhook_handler:
-    webhook_handler.attach_to_session(session)
-    ctx.add_shutdown_callback(webhook_handler.send_webhook)
-
-await ctx.connect()
 ```
 
-## What Gets Tracked
+## What Gets Sent
 
-After running these examples, you'll see webhook payloads containing:
+Each call is reported to SuperBryn once (`call.started`, then `call.ended` after the hang-up): the transcript with
+times, tool calls, each reply's latency parts, the models and settings, usage, LLM requests and failures. SuperBryn
+test calls are reported for testing; every other call is a production call, recorded in stereo.
 
-- 📝 Full conversation transcript with precise timing
-- 📊 Token usage (LLM input/output)
-- ⏱️ Latency metrics (LLM, STT, TTS)
-- 🎯 Model and provider information
-- 📞 Call duration and metadata
-- 🔍 System prompts and configuration
-
-Check your logs for `SUPERBRYN_WEBHOOK_SENT` to confirm successful delivery!
-
+Check your logs for `SUPERBRYN_CALL_REPORT_SENT` to confirm delivery.
