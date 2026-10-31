@@ -279,7 +279,12 @@ Realtime (speech-to-speech) models only. Cascaded (STT, LLM, TTS) agents send ex
 - Secure environment variable handling
 - No sensitive data logged in production
 
-[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/superbryndev/livekit-evals/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/superbryndev/livekit-evals/compare/v0.3.4...v0.4.0
+[0.3.4]: https://github.com/superbryndev/livekit-evals/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/superbryndev/livekit-evals/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/superbryndev/livekit-evals/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/superbryndev/livekit-evals/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/superbryndev/livekit-evals/compare/v0.2.14...v0.3.0
 [0.2.14]: https://github.com/superbryndev/livekit-evals/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/superbryndev/livekit-evals/compare/v0.2.12...v0.2.13
